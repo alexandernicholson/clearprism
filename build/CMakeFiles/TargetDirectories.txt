@@ -1,6 +1,0 @@
-/home/alexandernicholson/clearprism/build/CMakeFiles/clearprism.dir
-/home/alexandernicholson/clearprism/build/CMakeFiles/clearprism_tests.dir
-/home/alexandernicholson/clearprism/build/CMakeFiles/test_run.dir
-/home/alexandernicholson/clearprism/build/CMakeFiles/test.dir
-/home/alexandernicholson/clearprism/build/CMakeFiles/edit_cache.dir
-/home/alexandernicholson/clearprism/build/CMakeFiles/rebuild_cache.dir

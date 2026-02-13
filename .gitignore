@@ -1,0 +1,20 @@
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+build/
+
+# Binaries
+clearprism_tests
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
