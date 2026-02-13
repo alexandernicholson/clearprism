@@ -72,10 +72,17 @@ Any source whose `id` appears in the overrides exclusion list is removed from th
 
 ## When Sources Are Read
 
-The registry is read in two contexts:
+The registry is read in three contexts:
 
-1. **At `xCreate`/`xConnect` time** — to discover the schema from the first active source
-2. **At `xFilter` time** — to take a snapshot of active sources for the current scan
+1. **At `xCreate`/`xConnect` time** — initial load and schema discovery from the first active source
+2. **At `xFilter` time** — a snapshot of active sources is taken for the current scan
+3. **Auto-reload** — the registry is automatically re-read if the source list has become stale
+
+### Auto-Reload
+
+The registry tracks the time of its last reload. Before each snapshot, if more than `reload_interval_sec` seconds (default: 60) have elapsed since the last reload, the source list is automatically refreshed from disk. This means changes to the registry database (adding, removing, or deactivating sources) take effect within 60 seconds without restarting the virtual table.
+
+If the auto-reload fails (e.g., the registry file is temporarily locked), the extension continues with the previously loaded source list.
 
 Each scan gets its own snapshot, so changes to the registry take effect on the next query. Concurrent queries see independent snapshots.
 

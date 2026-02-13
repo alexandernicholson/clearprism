@@ -102,8 +102,14 @@ One instance per active scan (per `SELECT` statement). Manages iteration across 
 | `current_source_idx` | Which source database is currently being read |
 | `current_stmt` | Active `sqlite3_stmt` on the current source |
 | `saved_argv` | Deep copies of `xFilter` argv for re-binding across sources |
-| `row_counter` | Monotonically increasing synthetic rowid |
+| `row_counter` | Monotonically increasing counter (used for cache-served rowids) |
 | `serving_from_cache` | Flag indicating results are coming from L1 cache |
+| `limit_remaining` | Rows left to return before LIMIT is satisfied (-1 = no limit) |
+| `offset_remaining` | Rows left to skip for OFFSET (0 = no offset) |
+| `in_values` / `in_counts` | Expanded IN constraint values for binding across sources |
+| `cache_key` | Key for storing live query results into L1 cache |
+| `buffer_head/tail` | Linked list of rows buffered during live query for L1 population |
+| `buffer_overflow` | Set when result set exceeds per-query L1 budget (25% of max) |
 
 ## Query Execution Flow
 
@@ -113,10 +119,14 @@ Called by SQLite's query planner (potentially multiple times) to determine scan 
 
 1. Scans `aConstraint[]` for usable WHERE constraints
 2. Detects `_source_db = ?` constraint (critical optimization — limits scan to one source)
-3. Collects pushable constraints: `EQ`, `GT`, `GE`, `LT`, `LE`, `LIKE`
-4. Encodes plan into `idxStr` as pipe-delimited `colIdx:op` pairs (e.g., `"2:2|3:64"`)
-5. Sets `idxNum` bitmask with `CLEARPRISM_PLAN_*` flags
-6. Estimates cost based on number of sources and constraint selectivity
+3. Collects pushable constraints: `EQ`, `GT`, `GE`, `LT`, `LE`, `LIKE`, `NE`, `GLOB`, `IS NULL`, `IS NOT NULL`, `REGEXP`, `MATCH`
+4. Detects `LIMIT` and `OFFSET` constraints for pushdown
+5. Detects `IN` constraints via `sqlite3_vtab_in()` (SQLite 3.38.0+)
+6. Detects `rowid = ?` for composite rowid lookup (cost = 1.0)
+7. Checks if ORDER BY can be consumed (single-source queries only)
+8. Encodes plan into `idxStr` as pipe-delimited `colIdx:op[I]` pairs, with optional `#col:dir` ORDER BY section
+9. Sets `idxNum` bitmask with `CLEARPRISM_PLAN_*` flags
+10. Estimates cost based on number of sources and constraint selectivity
 
 ### xFilter (Scan Start)
 
@@ -125,8 +135,12 @@ Called once to begin a scan. Receives the plan chosen by `xBestIndex`.
 ```mermaid
 flowchart TD
     START["xFilter called"] --> DECODE["Decode plan from<br>idxNum + idxStr"]
-    DECODE --> EXTRACT["Extract _source_db<br>constraint if present"]
-    EXTRACT --> KEY["Build cache key"]
+    DECODE --> EXTRACT["Extract _source_db,<br>LIMIT, OFFSET, IN values"]
+    EXTRACT --> ROWID{"Rowid<br>lookup?"}
+    ROWID -- YES --> DECOMPOSE["Decode composite rowid<br>→ source_id + source_rowid"]
+    DECOMPOSE --> SINGLE_SRC["Query single source<br>WHERE rowid = ?"]
+    SINGLE_SRC --> READY
+    ROWID -- NO --> KEY["Build cache key"]
     KEY --> L1{"L1 cache<br>lookup"}
     L1 -- HIT --> FROM_CACHE["Set serving_from_cache = 1<br>Init cache cursor"]
     L1 -- MISS --> SNAP["Registry snapshot<br>(get active sources)"]
@@ -136,10 +150,13 @@ flowchart TD
     SINGLE --> PREP["Prepare first source:<br>checkout conn, prepare stmt"]
     ALL --> PREP
     PREP --> STEP["sqlite3_step()<br>position on first row"]
-    STEP -- ROW --> READY["Return SQLITE_OK"]
+    STEP -- ROW --> OFFSET{"OFFSET<br>remaining?"}
+    OFFSET -- YES --> SKIP["Skip rows<br>offset_remaining--"]
+    SKIP --> STEP
+    OFFSET -- NO --> READY["Return SQLITE_OK"]
     STEP -- DONE --> ADV["advance_to_next_source()"]
     STEP -- ERROR --> ADV
-    ADV --> READY
+    ADV --> OFFSET
     FROM_CACHE --> READY
 ```
 
@@ -148,7 +165,9 @@ flowchart TD
 ```mermaid
 flowchart TD
     NEXT["xNext called"] --> INC["row_counter++"]
-    INC --> CACHED{"Serving<br>from cache?"}
+    INC --> LIM{"LIMIT<br>reached?"}
+    LIM -- YES --> SET_EOF
+    LIM -- NO --> CACHED{"Serving<br>from cache?"}
     CACHED -- YES --> ADV_CACHE["Advance cache cursor"]
     ADV_CACHE --> EOF_CACHE{"Cache cursor<br>EOF?"}
     EOF_CACHE -- YES --> SET_EOF["Set eof = 1"]
@@ -208,14 +227,30 @@ The `_source_db` column constraint is always excluded from the generated SQL —
 
 Supported constraint operators:
 
-| SQLite Constant | SQL Operator |
-|----------------|--------------|
-| `SQLITE_INDEX_CONSTRAINT_EQ` | `=` |
-| `SQLITE_INDEX_CONSTRAINT_GT` | `>` |
-| `SQLITE_INDEX_CONSTRAINT_GE` | `>=` |
-| `SQLITE_INDEX_CONSTRAINT_LT` | `<` |
-| `SQLITE_INDEX_CONSTRAINT_LE` | `<=` |
-| `SQLITE_INDEX_CONSTRAINT_LIKE` | `LIKE` |
+| SQLite Constant | SQL Operator | Notes |
+|----------------|--------------|-------|
+| `SQLITE_INDEX_CONSTRAINT_EQ` | `=` | |
+| `SQLITE_INDEX_CONSTRAINT_GT` | `>` | |
+| `SQLITE_INDEX_CONSTRAINT_GE` | `>=` | |
+| `SQLITE_INDEX_CONSTRAINT_LT` | `<` | |
+| `SQLITE_INDEX_CONSTRAINT_LE` | `<=` | |
+| `SQLITE_INDEX_CONSTRAINT_LIKE` | `LIKE` | |
+| `SQLITE_INDEX_CONSTRAINT_NE` | `!=` | Requires SQLite 3.21.0+ |
+| `SQLITE_INDEX_CONSTRAINT_GLOB` | `GLOB` | Requires SQLite 3.21.0+ |
+| `SQLITE_INDEX_CONSTRAINT_ISNULL` | `IS NULL` | Unary (no parameter); requires SQLite 3.21.0+ |
+| `SQLITE_INDEX_CONSTRAINT_ISNOTNULL` | `IS NOT NULL` | Unary (no parameter); requires SQLite 3.21.0+ |
+| `SQLITE_INDEX_CONSTRAINT_LIMIT` | `LIMIT` | Row-count pushdown; requires SQLite 3.38.0+ |
+| `SQLITE_INDEX_CONSTRAINT_OFFSET` | `OFFSET` | Row-skip pushdown; requires SQLite 3.38.0+ |
+| `SQLITE_INDEX_CONSTRAINT_REGEXP` | `REGEXP` | Pushed with fallback — retries without if source lacks REGEXP |
+| `SQLITE_INDEX_CONSTRAINT_MATCH` | `MATCH` | Pushed with fallback — retries without if source lacks MATCH |
+
+**IN pushdown** (SQLite 3.38.0+): When `sqlite3_vtab_in()` detects an IN constraint, values are expanded via `sqlite3_vtab_in_first()/next()` and bound as `col IN (?,?,?)`.
+
+**ORDER BY pushdown**: When the query targets a single source (`_source_db = ?`), ORDER BY is consumed and pushed to the source SQL. Multi-source ORDER BY is handled by SQLite post-sort.
+
+**Composite rowids**: `WHERE rowid = ?` is detected and handled as a single-row lookup by decoding `(source_id << 40) | source_rowid`, finding the source, and querying `WHERE rowid = ?` on that source.
+
+Operators guarded by `#ifdef` are automatically excluded on older SQLite versions — SQLite applies them as post-filters instead.
 
 ## Thread Safety
 

@@ -30,6 +30,7 @@ clearprism_registry *clearprism_registry_open(const char *db_path, char **errmsg
     pthread_mutex_init(&reg->lock, NULL);
 
     reg->db_path = clearprism_strdup(db_path);
+    reg->reload_interval_sec = CLEARPRISM_DEFAULT_REGISTRY_RELOAD_SEC;
     if (!reg->db_path) {
         sqlite3_free(reg);
         if (errmsg) *errmsg = clearprism_strdup("out of memory");
@@ -142,6 +143,7 @@ int clearprism_registry_reload(clearprism_registry *reg, char **errmsg)
     clearprism_sources_free(reg->sources, reg->n_sources);
     reg->sources = sources;
     reg->n_sources = count;
+    reg->last_reload = time(NULL);
     pthread_mutex_unlock(&reg->lock);
 
     return SQLITE_OK;
@@ -155,6 +157,18 @@ int clearprism_registry_snapshot(clearprism_registry *reg,
     if (!reg) {
         if (errmsg) *errmsg = clearprism_strdup("registry is NULL");
         return SQLITE_ERROR;
+    }
+
+    /* Auto-reload if stale */
+    {
+        time_t now = time(NULL);
+        if (reg->reload_interval_sec > 0 &&
+            (now - reg->last_reload) >= reg->reload_interval_sec) {
+            char *reload_err = NULL;
+            clearprism_registry_reload(reg, &reload_err);
+            sqlite3_free(reload_err);
+            /* Non-fatal: if reload fails, we use the existing sources */
+        }
     }
 
     pthread_mutex_lock(&reg->lock);

@@ -100,7 +100,7 @@ CREATE VIRTUAL TABLE all_users USING clearprism(
 );
 ```
 
-This uses all defaults: 10K row L1 cache, 64 MiB memory limit, 32 max connections, no L2 disk cache.
+This uses all defaults: 10K row L1 cache, 64 MiB memory limit, 32 max connections, no L2 disk cache, 60-second registry auto-reload interval.
 
 ## Tuning Guidelines
 
@@ -119,3 +119,16 @@ If each source has millions of rows, keep `l1_max_rows` moderate to avoid excess
 ### Infrequently changing data
 
 Set `l2_refresh_sec` to a high value (e.g., 3600 for hourly) and increase L1 TTL by restarting the virtual table periodically. The L1 TTL is fixed at 60 seconds and is not currently user-configurable.
+
+## Internal Defaults
+
+These values are compiled into the extension and not currently user-configurable:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| L1 TTL | 60s | Time-to-live for L1 cache entries |
+| Registry reload interval | 60s | How often the source list is re-read from the registry DB |
+| Connection pool timeout | 5000ms | Max wait time when all connections are checked out |
+| L1 per-query budget | 25% of `l1_max_rows` | Max rows a single query can buffer into L1 |
+| Module iVersion | 3 (SQLite 3.38.0+), 0 otherwise | Enables `sqlite3_vtab_in` for IN pushdown |
+| Composite rowid shift | 40 bits | `(source_id << 40) \| source_rowid` — supports ~16M sources and ~1T rows per source |

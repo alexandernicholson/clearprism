@@ -23,9 +23,12 @@ The L1 cache stores query results in memory using a hash table with a doubly-lin
 The cache key is derived from:
 - Target table name
 - Source alias (if `_source_db` is constrained)
+- Constraint structure (column index and operator for each constraint)
 - Constraint parameter values
 
-Format: `"table_name:src=alias:p0=value0:p1=value1:"`
+Format: `"table_name:src=alias:c0=col:op:c1=col:op:p0=value0:p1=value1:"`
+
+Including the constraint structure in the key prevents collisions between queries with different operators but identical (or absent) parameter values — for example, `WHERE email IS NULL` vs `WHERE email IS NOT NULL`.
 
 ### Data Storage
 
@@ -45,6 +48,12 @@ L1 enforces two limits simultaneously:
 | Max bytes (estimated memory usage) | 64 MiB | `l1_max_bytes` |
 
 When an insert would exceed either limit, the least recently used entry is evicted. Eviction continues until both limits are satisfied. If a single entry exceeds both limits and the cache is empty, the insert is rejected (`SQLITE_FULL`).
+
+### L1 Population from Live Queries
+
+When a query misses both L1 and L2, Clearprism executes a live query against the source databases. As rows stream through, they are buffered in a linked list on the cursor. When the scan completes (all sources exhausted or LIMIT reached), the buffer is flushed into L1 so subsequent identical queries get a cache hit.
+
+To prevent a single large result set from evicting the entire cache, each query is limited to buffering at most **25% of `l1_max_rows`**. If the result exceeds this threshold, the buffer is discarded and the result is not cached.
 
 ### Thread Safety
 
@@ -147,11 +156,10 @@ L2 is considered "fresh" if `(now - last_refresh) < refresh_interval_sec`. When 
 | Event | Action |
 |-------|--------|
 | `xCreate` / `xConnect` | Create shadow table if not exists, start refresh thread |
-| `xFilter` (cache miss) | L2 not currently queried for individual lookups (primarily used for full refresh) |
+| `xFilter` (cache miss) | L2 queried via `clearprism_l2_query()` if fresh; result populates L1 |
 | `xDisconnect` / `xDestroy` | Set `running = 0`, join refresh thread, close both connections |
 
 ### Current Limitations
 
-- L2 currently does a full DELETE + INSERT refresh, not incremental updates
-- Individual query-level L2 lookups are not yet fully implemented — L2 primarily serves as a pre-warmed materialization
-- The refresh thread is detached (`pthread_detach`), which means it cleans up after itself but may still be running briefly after `xDisconnect`
+- L2 refreshes do a full DELETE + INSERT per cycle, not incremental updates
+- L2 query-time lookups parse the cache key to extract a source alias for filtering; queries without a source constraint search the entire shadow table

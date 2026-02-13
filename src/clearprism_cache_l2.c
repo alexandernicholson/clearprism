@@ -154,7 +154,6 @@ int clearprism_l2_start_refresh(clearprism_l2_cache *l2, char **errmsg)
         if (errmsg) *errmsg = clearprism_strdup("L2: failed to create refresh thread");
         return SQLITE_ERROR;
     }
-    pthread_detach(l2->refresh_thread);
     return SQLITE_OK;
 }
 

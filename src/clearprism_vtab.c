@@ -423,6 +423,33 @@ int clearprism_vtab_close(sqlite3_vtab_cursor *pCur)
         clearprism_cache_cursor_free(cur->cache_cursor);
     }
 
+    /* Free IN expansion arrays */
+    if (cur->in_values) {
+        for (int i = 0; i < cur->total_in_values; i++) {
+            sqlite3_value_free(cur->in_values[i]);
+        }
+        sqlite3_free(cur->in_values);
+    }
+    sqlite3_free(cur->in_offsets);
+    sqlite3_free(cur->in_counts);
+
+    /* Free L1 population buffer */
+    {
+        clearprism_l1_row *row = cur->buffer_head;
+        while (row) {
+            clearprism_l1_row *next = row->next;
+            if (row->values) {
+                for (int i = 0; i < row->n_values; i++) {
+                    sqlite3_value_free(row->values[i]);
+                }
+                sqlite3_free(row->values);
+            }
+            sqlite3_free(row);
+            row = next;
+        }
+        sqlite3_free(cur->cache_key);
+    }
+
     sqlite3_free(cur);
     return SQLITE_OK;
 }

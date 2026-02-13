@@ -34,6 +34,16 @@
 #define CLEARPRISM_PLAN_HAS_WHERE           0x02
 #define CLEARPRISM_PLAN_HAS_LIMIT           0x04
 #define CLEARPRISM_PLAN_USE_CACHE           0x08
+#define CLEARPRISM_PLAN_HAS_OFFSET          0x10
+#define CLEARPRISM_PLAN_ROWID_LOOKUP        0x20
+#define CLEARPRISM_PLAN_HAS_ORDER           0x40
+
+/* Composite rowid encoding: (source_id << 40) | source_rowid */
+#define CLEARPRISM_ROWID_SHIFT 40
+#define CLEARPRISM_ROWID_MASK  ((int64_t)((1LL << 40) - 1))
+
+/* Column offset: rowid is prepended to SELECT, shifting real columns by 1 */
+#define CLEARPRISM_COL_OFFSET 1
 
 /* Forward declarations */
 typedef struct clearprism_vtab       clearprism_vtab;
@@ -69,12 +79,17 @@ struct clearprism_source {
     int     priority;
 };
 
+/* Default registry reload interval */
+#define CLEARPRISM_DEFAULT_REGISTRY_RELOAD_SEC 60
+
 /* ---------- Registry ---------- */
 struct clearprism_registry {
     char           *db_path;
     sqlite3        *db;
     clearprism_source *sources;
     int             n_sources;
+    time_t          last_reload;
+    int             reload_interval_sec;
     pthread_mutex_t lock;
 };
 
@@ -168,11 +183,21 @@ struct clearprism_cache {
     clearprism_l2_cache *l2;
 };
 
+/* ---------- ORDER BY column ---------- */
+typedef struct clearprism_order_col clearprism_order_col;
+struct clearprism_order_col {
+    int col_idx;
+    int desc;  /* 1 for DESC, 0 for ASC */
+};
+
 /* ---------- WHERE constraint ---------- */
 struct clearprism_where_constraint {
     int  col_idx;   /* column index */
     int  op;        /* SQLITE_INDEX_CONSTRAINT_EQ, etc. */
     int  argv_idx;  /* index into argv[] (1-based as per SQLite convention) */
+    int  is_in;     /* 1 if this is an IN constraint (sqlite3_vtab_in) */
+    int  in_count;  /* number of values for IN constraint */
+    int  in_offset; /* start offset into cursor's in_values array */
 };
 
 /* ---------- Query plan (decoded from xBestIndex) ---------- */
@@ -181,6 +206,10 @@ struct clearprism_query_plan {
     clearprism_where_constraint *constraints;
     int  n_constraints;
     char *source_alias;      /* if source-constrained, the alias */
+    int64_t limit_value;     /* -1 = no limit */
+    int64_t offset_value;    /* 0 = no offset */
+    clearprism_order_col *order_cols;
+    int  n_order_cols;
 };
 
 /* ---------- Cache cursor for serving cached rows ---------- */
@@ -248,6 +277,25 @@ struct clearprism_cursor {
     /* Cache serving */
     clearprism_cache_cursor *cache_cursor;
     int      serving_from_cache;
+
+    /* LIMIT / OFFSET tracking */
+    int64_t  limit_remaining;       /* -1 = no limit, else rows left to return */
+    int64_t  offset_remaining;      /* 0 = no offset, else rows to skip */
+
+    /* L1 cache population buffer (collects rows during live query) */
+    char    *cache_key;             /* key for storing into L1 */
+    clearprism_l1_row *buffer_head; /* first buffered row */
+    clearprism_l1_row *buffer_tail; /* last buffered row */
+    int      buffer_n_rows;
+    size_t   buffer_bytes;
+    int      buffer_overflow;       /* 1 if result set too large to cache */
+
+    /* IN constraint expansion */
+    sqlite3_value **in_values;    /* flat array of all expanded IN values */
+    int *in_offsets;              /* start offset in in_values for each IN constraint */
+    int *in_counts;               /* count for each IN constraint */
+    int  n_in_constraints;
+    int  total_in_values;
 };
 
 /* ========== Public API Functions ========== */

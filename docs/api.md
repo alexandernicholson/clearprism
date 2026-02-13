@@ -247,7 +247,7 @@ Stops the refresh thread (if running), closes both database connections, and fre
 int clearprism_l2_start_refresh(clearprism_l2_cache *l2, char **errmsg);
 ```
 
-Starts the background refresh thread. The thread performs an initial refresh immediately, then refreshes at the configured interval. The thread is detached after creation.
+Starts the background refresh thread. The thread performs an initial refresh immediately, then refreshes at the configured interval. The thread is joined on destruction via `clearprism_l2_destroy()`.
 
 ### clearprism_l2_query
 
@@ -335,7 +335,7 @@ char *clearprism_where_generate_sql(const char *table,
                                      clearprism_query_plan *plan);
 ```
 
-Generates a parameterized `SELECT` statement with pushed-down WHERE constraints. The `_source_db` column constraint is excluded from the generated SQL.
+Generates a parameterized `SELECT` statement with pushed-down WHERE constraints. The generated SQL always prepends `rowid` to the column list for composite rowid encoding. The `_source_db` column constraint is excluded from the generated SQL. IN constraints generate `col IN (?,?,?)` with the correct number of placeholders. If the plan has ORDER BY columns, an `ORDER BY` clause is appended.
 
 ### clearprism_query_plan_clear
 
@@ -343,4 +343,4 @@ Generates a parameterized `SELECT` statement with pushed-down WHERE constraints.
 void clearprism_query_plan_clear(clearprism_query_plan *plan);
 ```
 
-Frees the constraint array and source alias in a query plan, then zeroes the structure.
+Frees the constraint array, ORDER BY columns, and source alias in a query plan, then zeroes the structure.

@@ -23,9 +23,15 @@ SELECT * FROM all_users WHERE _source_db = 'west_region';
 
 - **Federated queries** across 100+ SQLite databases with identical schemas
 - **Hidden `_source_db` column** on every row identifying which database it came from
-- **WHERE pushdown** sends constraints to each source database for efficient filtering
+- **WHERE pushdown** sends constraints (EQ, GT, GE, LT, LE, LIKE, NE, GLOB, IS NULL, IS NOT NULL, REGEXP, MATCH, IN) to each source database
+- **LIMIT/OFFSET pushdown** stops scanning after the requested rows, skips offset rows
+- **ORDER BY pushdown** for single-source queries (when `_source_db` is constrained)
+- **Stable composite rowids** encoding `(source_id << 40) | source_rowid` for efficient `WHERE rowid = ?` lookups
+- **IN pushdown** expands `WHERE col IN (...)` into parameterized queries on each source (SQLite 3.38.0+)
+- **REGEXP/MATCH fallback** pushes these operators to sources that support them, falls back to SQLite post-filtering otherwise
 - **Two-tier caching** with in-memory LRU (L1) and disk-based shadow tables (L2)
 - **Connection pooling** with lazy opening and LRU eviction
+- **Registry auto-reload** detects source list changes without restarting
 - **Resilient** — skips unavailable sources instead of failing the entire query
 - **Thread-safe** with per-component locking and a strict lock hierarchy
 

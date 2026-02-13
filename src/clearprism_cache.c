@@ -64,12 +64,41 @@ int clearprism_cache_lookup(clearprism_cache *cache, const char *key,
 
     /* Try L2 (if fresh) */
     if (cache->l2 && clearprism_l2_is_fresh(cache->l2)) {
-        /* For L2, we'd need to parse the key to extract WHERE/source info.
-           For simplicity, we do a full-table query from L2 when key doesn't
-           contain constraints. A more sophisticated implementation would
-           parse the cache key to build a proper L2 query. */
-        /* For now, L2 is mainly useful as a full refresh —
-           individual query caching is handled by L1. */
+        /* Parse cache key to extract source alias for L2 filtering.
+           Key format: "table:src=alias:p0=val:..." */
+        const char *source_alias = NULL;
+        char alias_buf[256];
+        const char *src_pos = strstr(key, "src=");
+        if (src_pos) {
+            src_pos += 4;  /* skip "src=" */
+            const char *end = strchr(src_pos, ':');
+            if (end && (size_t)(end - src_pos) < sizeof(alias_buf)) {
+                memcpy(alias_buf, src_pos, end - src_pos);
+                alias_buf[end - src_pos] = '\0';
+                source_alias = alias_buf;
+            }
+        }
+
+        char *l2_err = NULL;
+        sqlite3_stmt *l2_stmt = clearprism_l2_query(cache->l2, NULL,
+                                                       source_alias, &l2_err);
+        sqlite3_free(l2_err);
+
+        if (l2_stmt) {
+            int rc = sqlite3_step(l2_stmt);
+            if (rc == SQLITE_ROW) {
+                /* L2 has data — create a cache cursor backed by the L2 statement */
+                clearprism_cache_cursor *cc = sqlite3_malloc(sizeof(*cc));
+                if (cc) {
+                    memset(cc, 0, sizeof(*cc));
+                    cc->l2_stmt = l2_stmt;
+                    *out_cursor = cc;
+                    return 1;
+                }
+            }
+            /* No rows or alloc failed */
+            sqlite3_finalize(l2_stmt);
+        }
     }
 
     return 0;

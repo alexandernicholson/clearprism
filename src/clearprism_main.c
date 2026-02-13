@@ -16,7 +16,11 @@ SQLITE_EXTENSION_INIT1
 #include "clearprism.h"
 
 static sqlite3_module clearprism_module = {
+#if SQLITE_VERSION_NUMBER >= 3038000
+    3,                              /* iVersion — enables sqlite3_vtab_in */
+#else
     0,                              /* iVersion */
+#endif
     clearprism_vtab_create,         /* xCreate */
     clearprism_vtab_connect,        /* xConnect */
     clearprism_vtab_best_index,     /* xBestIndex */

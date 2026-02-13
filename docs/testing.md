@@ -45,7 +45,7 @@ Expected output:
   PASS: SELECT returns 6 rows total
   ...
 
-=== Results: N/N passed ===
+=== Results: 81/81 passed ===
 ```
 
 ## Test Structure
@@ -58,7 +58,7 @@ All tests are in the `test/` directory:
 | `test_registry.c` | Registry subsystem | Open/close, snapshot with priority ordering, invalid paths, NULL path |
 | `test_connpool.c` | Connection pool | Create/destroy, checkout/checkin, connection reuse, multiple DBs, LRU eviction, invalid paths |
 | `test_cache.c` | L1 + unified cache | Create/destroy, insert/lookup, LRU eviction, TTL expiry (2s sleep), unified cache facade |
-| `test_vtab.c` | End-to-end virtual table | Basic SELECT across 3 sources, `_source_db` filter, WHERE pushdown (LIKE, EQ), empty results, cache_db mode, monotonic rowids |
+| `test_vtab.c` | End-to-end virtual table | Basic SELECT across 3 sources, `_source_db` filter, WHERE pushdown (LIKE, EQ, NE, GLOB, IS NULL, IS NOT NULL, IN), empty results, cache_db mode, composite rowids (stable + lookup), L1 cache population, OFFSET, ORDER BY (single-source), combined queries, registry auto-reload |
 
 ## Test Framework
 
@@ -146,6 +146,17 @@ users: (20, 'Frank', 'frank@north.com')
 | `test_vtab_empty_result` | Non-existent `_source_db` value returns 0 rows |
 | `test_vtab_with_cache` | Virtual table with `cache_db` option returns correct results |
 | `test_vtab_rowid` | Rowids are monotonically increasing across all sources |
+| `test_vtab_l1_cache_population` | Running the same query twice returns cached results on the second run |
+| `test_vtab_where_ne` | `WHERE name != 'Alice'` returns 5 rows, excludes Alice |
+| `test_vtab_where_is_null` | `WHERE email IS NULL` returns 1 row; `WHERE email IS NOT NULL` returns 6 rows |
+| `test_vtab_where_glob` | `WHERE email GLOB '*@example.com'` returns 3 matching rows |
+| `test_vtab_registry_auto_reload` | Registry auto-reload mechanism is present and functional |
+| `test_vtab_rowid_stable` | Same query twice returns same rowids; rowids encode source identity |
+| `test_vtab_rowid_lookup` | `WHERE rowid = N` returns exactly 1 row efficiently |
+| `test_vtab_offset` | `LIMIT 2 OFFSET 1` returns correct rows; large OFFSET returns 0 rows |
+| `test_vtab_orderby_single_source` | `WHERE _source_db = 'west' ORDER BY name DESC` returns correctly ordered rows |
+| `test_vtab_in` | `WHERE name IN ('Alice', 'Charlie', 'Frank')` returns exactly 3 matching rows |
+| `test_vtab_combined` | Combined WHERE + ORDER BY + LIMIT on single source returns correct result |
 
 ## Writing New Tests
 
