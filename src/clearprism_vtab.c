@@ -1,0 +1,428 @@
+/*
+ * clearprism_vtab.c — xCreate, xConnect, xDisconnect, xDestroy, xOpen, xClose
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#if SQLITE_CORE
+#include <sqlite3.h>
+#else
+#include <sqlite3ext.h>
+SQLITE_EXTENSION_INIT3
+#endif
+
+#include "clearprism.h"
+
+/* Internal helpers */
+static int vtab_parse_args(int argc, const char *const *argv,
+                            clearprism_vtab *vtab, char **pzErr);
+static int vtab_discover_schema(clearprism_vtab *vtab, char **pzErr);
+static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr);
+static void vtab_free(clearprism_vtab *vtab);
+
+/*
+ * Parse a single key=value argument. Supports optional quoting with ' or ".
+ */
+static int parse_kv(const char *arg, char **key, char **value)
+{
+    const char *eq = strchr(arg, '=');
+    if (!eq) return 0;
+
+    size_t klen = (size_t)(eq - arg);
+    /* Skip leading whitespace in key */
+    while (klen > 0 && (arg[0] == ' ' || arg[0] == '\t')) {
+        arg++;
+        klen--;
+    }
+    /* Trim trailing whitespace in key */
+    while (klen > 0 && (arg[klen - 1] == ' ' || arg[klen - 1] == '\t')) {
+        klen--;
+    }
+
+    *key = sqlite3_malloc((int)(klen + 1));
+    if (!*key) return 0;
+    memcpy(*key, arg, klen);
+    (*key)[klen] = '\0';
+
+    const char *vstart = eq + 1;
+    /* Skip leading whitespace */
+    while (*vstart == ' ' || *vstart == '\t') vstart++;
+
+    /* Strip quotes */
+    size_t vlen = strlen(vstart);
+    if (vlen >= 2 && ((vstart[0] == '\'' && vstart[vlen - 1] == '\'') ||
+                       (vstart[0] == '"' && vstart[vlen - 1] == '"'))) {
+        vstart++;
+        vlen -= 2;
+    }
+    /* Trim trailing whitespace */
+    while (vlen > 0 && (vstart[vlen - 1] == ' ' || vstart[vlen - 1] == '\t')) {
+        vlen--;
+    }
+
+    *value = sqlite3_malloc((int)(vlen + 1));
+    if (!*value) {
+        sqlite3_free(*key);
+        *key = NULL;
+        return 0;
+    }
+    memcpy(*value, vstart, vlen);
+    (*value)[vlen] = '\0';
+
+    return 1;
+}
+
+static int vtab_parse_args(int argc, const char *const *argv,
+                            clearprism_vtab *vtab, char **pzErr)
+{
+    /* argv[0] = module name, argv[1] = database name, argv[2] = table name
+       argv[3..] = user arguments */
+
+    /* Set defaults */
+    vtab->l1_max_rows = CLEARPRISM_DEFAULT_L1_MAX_ROWS;
+    vtab->l1_max_bytes = CLEARPRISM_DEFAULT_L1_MAX_BYTES;
+    vtab->pool_max_open = CLEARPRISM_DEFAULT_POOL_MAX_OPEN;
+    vtab->l2_refresh_interval_sec = CLEARPRISM_DEFAULT_L2_REFRESH_SEC;
+
+    for (int i = 3; i < argc; i++) {
+        char *key = NULL, *value = NULL;
+        if (!parse_kv(argv[i], &key, &value)) {
+            continue;  /* skip unparseable args */
+        }
+
+        if (strcmp(key, "registry_db") == 0) {
+            vtab->registry_path = value;
+            value = NULL;  /* transfer ownership */
+        } else if (strcmp(key, "table") == 0) {
+            vtab->target_table = value;
+            value = NULL;
+        } else if (strcmp(key, "cache_db") == 0) {
+            vtab->cache_db_path = value;
+            value = NULL;
+        } else if (strcmp(key, "l1_max_rows") == 0) {
+            vtab->l1_max_rows = atoll(value);
+        } else if (strcmp(key, "l1_max_bytes") == 0) {
+            vtab->l1_max_bytes = atoll(value);
+        } else if (strcmp(key, "pool_max_open") == 0) {
+            vtab->pool_max_open = atoi(value);
+        } else if (strcmp(key, "l2_refresh_sec") == 0) {
+            vtab->l2_refresh_interval_sec = atoi(value);
+        }
+        /* else: unknown key, silently ignore */
+
+        sqlite3_free(key);
+        sqlite3_free(value);
+    }
+
+    if (!vtab->registry_path) {
+        *pzErr = clearprism_strdup("clearprism: 'registry_db' argument is required");
+        return SQLITE_ERROR;
+    }
+    if (!vtab->target_table) {
+        *pzErr = clearprism_strdup("clearprism: 'table' argument is required");
+        return SQLITE_ERROR;
+    }
+
+    return SQLITE_OK;
+}
+
+static int vtab_discover_schema(clearprism_vtab *vtab, char **pzErr)
+{
+    /* Get first active source to introspect its schema */
+    clearprism_source *sources = NULL;
+    int n_sources = 0;
+    char *errmsg = NULL;
+
+    int rc = clearprism_registry_snapshot(vtab->registry, vtab->target_table,
+                                           &sources, &n_sources, &errmsg);
+    if (rc != SQLITE_OK || n_sources == 0) {
+        if (n_sources == 0 && rc == SQLITE_OK) {
+            *pzErr = clearprism_mprintf(
+                "clearprism: no active sources in registry '%s'",
+                vtab->registry_path);
+        } else {
+            *pzErr = errmsg ? errmsg : clearprism_strdup("registry snapshot failed");
+        }
+        clearprism_sources_free(sources, n_sources);
+        return SQLITE_ERROR;
+    }
+
+    /* Open first source to run PRAGMA table_info */
+    sqlite3 *src_db = NULL;
+    rc = sqlite3_open_v2(sources[0].path, &src_db,
+                          SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+    if (rc != SQLITE_OK) {
+        *pzErr = clearprism_mprintf(
+            "clearprism: cannot open source '%s' for schema discovery: %s",
+            sources[0].path, sqlite3_errmsg(src_db));
+        sqlite3_close(src_db);
+        clearprism_sources_free(sources, n_sources);
+        return SQLITE_ERROR;
+    }
+
+    char *pragma_sql = clearprism_mprintf("PRAGMA table_info(\"%s\")", vtab->target_table);
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(src_db, pragma_sql, -1, &stmt, NULL);
+    sqlite3_free(pragma_sql);
+
+    if (rc != SQLITE_OK) {
+        *pzErr = clearprism_mprintf(
+            "clearprism: PRAGMA table_info failed on '%s': %s",
+            sources[0].path, sqlite3_errmsg(src_db));
+        sqlite3_close(src_db);
+        clearprism_sources_free(sources, n_sources);
+        return SQLITE_ERROR;
+    }
+
+    /* Read columns */
+    int col_capacity = 16;
+    vtab->cols = sqlite3_malloc(col_capacity * (int)sizeof(*vtab->cols));
+    vtab->nCol = 0;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (vtab->nCol >= col_capacity) {
+            col_capacity *= 2;
+            vtab->cols = sqlite3_realloc(vtab->cols,
+                                          col_capacity * (int)sizeof(*vtab->cols));
+        }
+        clearprism_col_def *col = &vtab->cols[vtab->nCol];
+        col->name = clearprism_strdup((const char *)sqlite3_column_text(stmt, 1));
+        const char *type_text = (const char *)sqlite3_column_text(stmt, 2);
+        col->type = clearprism_strdup(type_text ? type_text : "");
+        col->notnull = sqlite3_column_int(stmt, 3);
+        col->pk = sqlite3_column_int(stmt, 5);
+        vtab->nCol++;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(src_db);
+    clearprism_sources_free(sources, n_sources);
+
+    if (vtab->nCol == 0) {
+        *pzErr = clearprism_mprintf(
+            "clearprism: table '%s' has no columns or doesn't exist in source",
+            vtab->target_table);
+        return SQLITE_ERROR;
+    }
+
+    /* Build CREATE TABLE SQL for sqlite3_declare_vtab */
+    size_t sql_size = 256;
+    for (int i = 0; i < vtab->nCol; i++) {
+        sql_size += strlen(vtab->cols[i].name) + strlen(vtab->cols[i].type) + 32;
+    }
+    char *sql = sqlite3_malloc((int)sql_size);
+    int pos = snprintf(sql, sql_size, "CREATE TABLE x(");
+
+    for (int i = 0; i < vtab->nCol; i++) {
+        if (i > 0) pos += snprintf(sql + pos, sql_size - pos, ", ");
+        pos += snprintf(sql + pos, sql_size - pos, "\"%s\"", vtab->cols[i].name);
+        if (vtab->cols[i].type[0]) {
+            pos += snprintf(sql + pos, sql_size - pos, " %s", vtab->cols[i].type);
+        }
+    }
+    /* Add hidden _source_db column */
+    pos += snprintf(sql + pos, sql_size - pos, ", _source_db TEXT HIDDEN)");
+    vtab->create_table_sql = sql;
+
+    return SQLITE_OK;
+}
+
+static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr)
+{
+    /* Connection pool */
+    vtab->pool = clearprism_connpool_create(vtab->pool_max_open,
+                                             CLEARPRISM_DEFAULT_POOL_TIMEOUT);
+    if (!vtab->pool) {
+        *pzErr = clearprism_strdup("clearprism: failed to create connection pool");
+        return SQLITE_ERROR;
+    }
+
+    /* L1 cache */
+    clearprism_l1_cache *l1 = clearprism_l1_create(vtab->l1_max_rows,
+                                                     vtab->l1_max_bytes,
+                                                     CLEARPRISM_DEFAULT_L1_TTL_SEC);
+    if (!l1) {
+        *pzErr = clearprism_strdup("clearprism: failed to create L1 cache");
+        return SQLITE_ERROR;
+    }
+
+    /* L2 cache (optional — only if cache_db is specified) */
+    clearprism_l2_cache *l2 = NULL;
+    if (vtab->cache_db_path) {
+        char *l2_err = NULL;
+        l2 = clearprism_l2_create(vtab->cache_db_path, vtab->target_table,
+                                    vtab->cols, vtab->nCol,
+                                    vtab->l2_refresh_interval_sec,
+                                    vtab->registry, vtab->pool, &l2_err);
+        if (!l2) {
+            /* L2 failure is non-fatal — log and continue without it */
+            sqlite3_free(l2_err);
+        } else {
+            /* Start background refresh thread */
+            char *start_err = NULL;
+            clearprism_l2_start_refresh(l2, &start_err);
+            sqlite3_free(start_err);
+        }
+    }
+
+    vtab->cache = clearprism_cache_create(l1, l2);
+    return SQLITE_OK;
+}
+
+static int vtab_init(sqlite3 *db, int argc, const char *const *argv,
+                      sqlite3_vtab **ppVtab, char **pzErr)
+{
+    clearprism_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+    if (!vtab) {
+        *pzErr = clearprism_strdup("clearprism: out of memory");
+        return SQLITE_NOMEM;
+    }
+    memset(vtab, 0, sizeof(*vtab));
+    vtab->host_db = db;
+    pthread_mutex_init(&vtab->lock, NULL);
+
+    int rc = vtab_parse_args(argc, argv, vtab, pzErr);
+    if (rc != SQLITE_OK) {
+        vtab_free(vtab);
+        return rc;
+    }
+
+    /* Open registry */
+    char *reg_err = NULL;
+    vtab->registry = clearprism_registry_open(vtab->registry_path, &reg_err);
+    if (!vtab->registry) {
+        *pzErr = reg_err ? reg_err : clearprism_strdup("failed to open registry");
+        vtab_free(vtab);
+        return SQLITE_ERROR;
+    }
+
+    /* Discover schema from first source */
+    rc = vtab_discover_schema(vtab, pzErr);
+    if (rc != SQLITE_OK) {
+        vtab_free(vtab);
+        return rc;
+    }
+
+    /* Declare the virtual table schema */
+    rc = sqlite3_declare_vtab(db, vtab->create_table_sql);
+    if (rc != SQLITE_OK) {
+        *pzErr = clearprism_mprintf("clearprism: declare_vtab failed: %s",
+                                     sqlite3_errmsg(db));
+        vtab_free(vtab);
+        return rc;
+    }
+
+    /* Initialize subsystems */
+    rc = vtab_init_subsystems(vtab, pzErr);
+    if (rc != SQLITE_OK) {
+        vtab_free(vtab);
+        return rc;
+    }
+
+    *ppVtab = &vtab->base;
+    return SQLITE_OK;
+}
+
+int clearprism_vtab_create(sqlite3 *db, void *pAux, int argc,
+                            const char *const *argv, sqlite3_vtab **ppVtab,
+                            char **pzErr)
+{
+    (void)pAux;
+    return vtab_init(db, argc, argv, ppVtab, pzErr);
+}
+
+int clearprism_vtab_connect(sqlite3 *db, void *pAux, int argc,
+                             const char *const *argv, sqlite3_vtab **ppVtab,
+                             char **pzErr)
+{
+    (void)pAux;
+    return vtab_init(db, argc, argv, ppVtab, pzErr);
+}
+
+static void vtab_free(clearprism_vtab *vtab)
+{
+    if (!vtab) return;
+
+    if (vtab->cache) clearprism_cache_destroy(vtab->cache);
+    if (vtab->pool) clearprism_connpool_destroy(vtab->pool);
+    if (vtab->registry) clearprism_registry_close(vtab->registry);
+
+    sqlite3_free(vtab->registry_path);
+    sqlite3_free(vtab->target_table);
+    sqlite3_free(vtab->cache_db_path);
+    sqlite3_free(vtab->create_table_sql);
+
+    if (vtab->cols) {
+        for (int i = 0; i < vtab->nCol; i++) {
+            sqlite3_free(vtab->cols[i].name);
+            sqlite3_free(vtab->cols[i].type);
+        }
+        sqlite3_free(vtab->cols);
+    }
+
+    pthread_mutex_destroy(&vtab->lock);
+    sqlite3_free(vtab);
+}
+
+int clearprism_vtab_disconnect(sqlite3_vtab *pVtab)
+{
+    vtab_free((clearprism_vtab *)pVtab);
+    return SQLITE_OK;
+}
+
+int clearprism_vtab_destroy(sqlite3_vtab *pVtab)
+{
+    vtab_free((clearprism_vtab *)pVtab);
+    return SQLITE_OK;
+}
+
+int clearprism_vtab_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor)
+{
+    clearprism_cursor *cur = sqlite3_malloc(sizeof(*cur));
+    if (!cur) return SQLITE_NOMEM;
+    memset(cur, 0, sizeof(*cur));
+    cur->vtab = (clearprism_vtab *)pVtab;
+    cur->eof = 1;
+    *ppCursor = &cur->base;
+    return SQLITE_OK;
+}
+
+int clearprism_vtab_close(sqlite3_vtab_cursor *pCur)
+{
+    clearprism_cursor *cur = (clearprism_cursor *)pCur;
+
+    /* Finalize any open statement */
+    if (cur->current_stmt) {
+        sqlite3_finalize(cur->current_stmt);
+    }
+
+    /* Check in any checked-out connection */
+    if (cur->current_conn && cur->sources &&
+        cur->current_source_idx < cur->n_sources) {
+        clearprism_connpool_checkin(cur->vtab->pool,
+                                    cur->sources[cur->current_source_idx].path);
+    }
+
+    /* Free query plan */
+    clearprism_query_plan_clear(&cur->plan);
+
+    /* Free saved argv */
+    if (cur->saved_argv) {
+        for (int i = 0; i < cur->saved_argc; i++) {
+            sqlite3_value_free(cur->saved_argv[i]);
+        }
+        sqlite3_free(cur->saved_argv);
+    }
+
+    /* Free source snapshot */
+    clearprism_sources_free(cur->sources, cur->n_sources);
+
+    /* Free cache cursor */
+    if (cur->cache_cursor) {
+        clearprism_cache_cursor_free(cur->cache_cursor);
+    }
+
+    sqlite3_free(cur);
+    return SQLITE_OK;
+}

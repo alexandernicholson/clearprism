@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/alexandernicholson/clearprism/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

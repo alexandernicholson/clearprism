@@ -1,0 +1,366 @@
+/*
+ * clearprism.h — Public API, version macros, shared typedefs
+ *
+ * Clearprism: Federated SQLite Virtual Table Extension
+ * Read-only federation across 100+ SQLite databases sharing the same schema.
+ */
+
+#ifndef CLEARPRISM_H
+#define CLEARPRISM_H
+
+#include <sqlite3ext.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* Version macros */
+#define CLEARPRISM_VERSION_MAJOR 1
+#define CLEARPRISM_VERSION_MINOR 0
+#define CLEARPRISM_VERSION_PATCH 0
+#define CLEARPRISM_VERSION_STRING "1.0.0"
+
+/* Default configuration */
+#define CLEARPRISM_DEFAULT_L1_MAX_ROWS    10000
+#define CLEARPRISM_DEFAULT_L1_MAX_BYTES   (64 * 1024 * 1024)  /* 64 MiB */
+#define CLEARPRISM_DEFAULT_L1_TTL_SEC     60
+#define CLEARPRISM_DEFAULT_POOL_MAX_OPEN  32
+#define CLEARPRISM_DEFAULT_POOL_TIMEOUT   5000  /* 5 seconds in ms */
+#define CLEARPRISM_DEFAULT_L2_REFRESH_SEC 300
+#define CLEARPRISM_CONNPOOL_INIT_BUCKETS  256
+
+/* xBestIndex plan bitmask flags (stored in idxNum) */
+#define CLEARPRISM_PLAN_SOURCE_CONSTRAINED  0x01
+#define CLEARPRISM_PLAN_HAS_WHERE           0x02
+#define CLEARPRISM_PLAN_HAS_LIMIT           0x04
+#define CLEARPRISM_PLAN_USE_CACHE           0x08
+
+/* Forward declarations */
+typedef struct clearprism_vtab       clearprism_vtab;
+typedef struct clearprism_cursor     clearprism_cursor;
+typedef struct clearprism_source     clearprism_source;
+typedef struct clearprism_registry   clearprism_registry;
+typedef struct clearprism_connpool   clearprism_connpool;
+typedef struct clearprism_pool_entry clearprism_pool_entry;
+typedef struct clearprism_l1_cache   clearprism_l1_cache;
+typedef struct clearprism_l1_entry   clearprism_l1_entry;
+typedef struct clearprism_l1_row     clearprism_l1_row;
+typedef struct clearprism_l2_cache   clearprism_l2_cache;
+typedef struct clearprism_cache      clearprism_cache;
+typedef struct clearprism_col_def    clearprism_col_def;
+typedef struct clearprism_query_plan clearprism_query_plan;
+typedef struct clearprism_where_constraint clearprism_where_constraint;
+typedef struct clearprism_cache_cursor clearprism_cache_cursor;
+
+/* ---------- Column definition ---------- */
+struct clearprism_col_def {
+    char *name;
+    char *type;       /* SQLite type affinity string */
+    int   notnull;
+    int   pk;
+};
+
+/* ---------- Source database entry ---------- */
+struct clearprism_source {
+    int64_t id;
+    char   *path;
+    char   *alias;
+    int     active;
+    int     priority;
+};
+
+/* ---------- Registry ---------- */
+struct clearprism_registry {
+    char           *db_path;
+    sqlite3        *db;
+    clearprism_source *sources;
+    int             n_sources;
+    pthread_mutex_t lock;
+};
+
+/* ---------- Connection pool entry ---------- */
+struct clearprism_pool_entry {
+    char    *db_path;
+    char    *alias;
+    sqlite3 *conn;
+    int      checkout_count;
+    time_t   last_used;
+    uint64_t path_hash;
+    clearprism_pool_entry *next;  /* hash chain */
+    /* LRU doubly-linked list */
+    clearprism_pool_entry *lru_prev;
+    clearprism_pool_entry *lru_next;
+};
+
+/* ---------- Connection pool ---------- */
+struct clearprism_connpool {
+    clearprism_pool_entry **buckets;
+    int      n_buckets;
+    int      n_open;
+    int      max_open;
+    int      timeout_ms;
+    /* LRU list (head = most recently used, tail = least recently used) */
+    clearprism_pool_entry *lru_head;
+    clearprism_pool_entry *lru_tail;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;   /* signaled when a connection is checked in */
+};
+
+/* ---------- L1 in-memory LRU cache ---------- */
+struct clearprism_l1_row {
+    sqlite3_value **values;  /* deep copies, nCol+1 entries (_source_db included) */
+    int             n_values;
+    clearprism_l1_row *next;
+};
+
+struct clearprism_l1_entry {
+    uint64_t     key_hash;
+    char        *key_str;          /* full cache key string */
+    clearprism_l1_row *rows;
+    int          n_rows;
+    size_t       byte_size;        /* estimated memory usage */
+    time_t       created_at;
+    int          ttl_sec;
+    /* Hash table chain */
+    clearprism_l1_entry *hash_next;
+    /* LRU doubly-linked list */
+    clearprism_l1_entry *lru_prev;
+    clearprism_l1_entry *lru_next;
+};
+
+struct clearprism_l1_cache {
+    clearprism_l1_entry **buckets;
+    int      n_buckets;
+    int      n_entries;
+    int64_t  total_rows;
+    int64_t  total_bytes;
+    int64_t  max_rows;
+    int64_t  max_bytes;
+    int      default_ttl_sec;
+    /* LRU list */
+    clearprism_l1_entry *lru_head;
+    clearprism_l1_entry *lru_tail;
+    pthread_mutex_t lock;
+};
+
+/* ---------- L2 shadow table cache ---------- */
+struct clearprism_l2_cache {
+    char    *cache_db_path;
+    sqlite3 *reader_db;          /* for query threads (WAL mode) */
+    sqlite3 *writer_db;          /* for background refresh thread */
+    char    *target_table;
+    char    *shadow_table_name;  /* _clearprism_cache_{table} */
+    int      n_cols;
+    clearprism_col_def *cols;
+    int      refresh_interval_sec;
+    time_t   last_refresh;
+    int      running;            /* flag for background thread */
+    pthread_t refresh_thread;
+    pthread_mutex_t lock;
+    /* Back-reference for source enumeration during refresh */
+    clearprism_registry *registry;
+    clearprism_connpool *pool;
+};
+
+/* ---------- Unified cache ---------- */
+struct clearprism_cache {
+    clearprism_l1_cache *l1;
+    clearprism_l2_cache *l2;
+};
+
+/* ---------- WHERE constraint ---------- */
+struct clearprism_where_constraint {
+    int  col_idx;   /* column index */
+    int  op;        /* SQLITE_INDEX_CONSTRAINT_EQ, etc. */
+    int  argv_idx;  /* index into argv[] (1-based as per SQLite convention) */
+};
+
+/* ---------- Query plan (decoded from xBestIndex) ---------- */
+struct clearprism_query_plan {
+    int  flags;              /* CLEARPRISM_PLAN_* bitmask */
+    clearprism_where_constraint *constraints;
+    int  n_constraints;
+    char *source_alias;      /* if source-constrained, the alias */
+};
+
+/* ---------- Cache cursor for serving cached rows ---------- */
+struct clearprism_cache_cursor {
+    /* L1 cached data */
+    clearprism_l1_row *rows;
+    clearprism_l1_row *current_row;
+    int n_rows;
+    int current_idx;
+    /* L2 cursor */
+    sqlite3_stmt *l2_stmt;
+};
+
+/* ---------- Virtual table ---------- */
+struct clearprism_vtab {
+    sqlite3_vtab    base;           /* Must be first member */
+    sqlite3        *host_db;        /* The database connection that loaded us */
+    char           *registry_path;
+    char           *target_table;
+    char           *cache_db_path;
+
+    /* Schema */
+    int             nCol;           /* number of real columns (excluding _source_db) */
+    clearprism_col_def *cols;
+    char           *create_table_sql;  /* for xConnect schema declaration */
+
+    /* Subsystems */
+    clearprism_registry *registry;
+    clearprism_connpool *pool;
+    clearprism_cache    *cache;
+
+    /* Configuration */
+    int64_t  l1_max_rows;
+    int64_t  l1_max_bytes;
+    int      pool_max_open;
+    int      l2_refresh_interval_sec;
+
+    pthread_mutex_t lock;
+};
+
+/* ---------- Cursor ---------- */
+struct clearprism_cursor {
+    sqlite3_vtab_cursor base;       /* Must be first member */
+    clearprism_vtab    *vtab;
+
+    /* Source iteration */
+    clearprism_source  *sources;    /* snapshot taken at xFilter */
+    int                 n_sources;
+    int                 current_source_idx;
+    sqlite3            *current_conn;
+    sqlite3_stmt       *current_stmt;
+    char               *current_source_alias;
+
+    /* Query plan */
+    clearprism_query_plan plan;
+
+    /* Saved argv for re-binding across sources */
+    sqlite3_value **saved_argv;
+    int             saved_argc;
+
+    /* Row tracking */
+    int64_t  row_counter;           /* monotonic synthetic rowid */
+    int      eof;
+
+    /* Cache serving */
+    clearprism_cache_cursor *cache_cursor;
+    int      serving_from_cache;
+};
+
+/* ========== Public API Functions ========== */
+
+/* clearprism_main.c */
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int sqlite3_clearprism_init(sqlite3 *db, char **pzErrMsg,
+                            const sqlite3_api_routines *pApi);
+
+/* clearprism_util.c */
+uint64_t clearprism_fnv1a(const void *data, size_t len);
+uint64_t clearprism_fnv1a_str(const char *str);
+char    *clearprism_mprintf(const char *fmt, ...);
+void     clearprism_set_errmsg(sqlite3_vtab *vtab, const char *fmt, ...);
+char    *clearprism_strdup(const char *s);
+size_t   clearprism_value_memsize(sqlite3_value *val);
+
+/* clearprism_registry.c */
+clearprism_registry *clearprism_registry_open(const char *db_path, char **errmsg);
+void     clearprism_registry_close(clearprism_registry *reg);
+int      clearprism_registry_reload(clearprism_registry *reg, char **errmsg);
+int      clearprism_registry_snapshot(clearprism_registry *reg,
+                                      const char *table_name,
+                                      clearprism_source **out_sources,
+                                      int *out_n, char **errmsg);
+void     clearprism_sources_free(clearprism_source *sources, int n);
+
+/* clearprism_connpool.c */
+clearprism_connpool *clearprism_connpool_create(int max_open, int timeout_ms);
+void     clearprism_connpool_destroy(clearprism_connpool *pool);
+sqlite3 *clearprism_connpool_checkout(clearprism_connpool *pool,
+                                       const char *db_path,
+                                       const char *alias,
+                                       char **errmsg);
+void     clearprism_connpool_checkin(clearprism_connpool *pool,
+                                      const char *db_path);
+
+/* clearprism_where.c */
+char    *clearprism_where_encode(sqlite3_index_info *info, int nCol, int *out_flags);
+int      clearprism_where_decode(const char *idx_str,
+                                  clearprism_query_plan *plan);
+char    *clearprism_where_generate_sql(const char *table,
+                                        clearprism_col_def *cols, int nCol,
+                                        clearprism_query_plan *plan);
+void     clearprism_query_plan_clear(clearprism_query_plan *plan);
+
+/* clearprism_vtab.c */
+int clearprism_vtab_create(sqlite3 *db, void *pAux, int argc,
+                            const char *const *argv, sqlite3_vtab **ppVtab,
+                            char **pzErr);
+int clearprism_vtab_connect(sqlite3 *db, void *pAux, int argc,
+                             const char *const *argv, sqlite3_vtab **ppVtab,
+                             char **pzErr);
+int clearprism_vtab_disconnect(sqlite3_vtab *pVtab);
+int clearprism_vtab_destroy(sqlite3_vtab *pVtab);
+int clearprism_vtab_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor);
+int clearprism_vtab_close(sqlite3_vtab_cursor *cur);
+
+/* clearprism_query.c */
+int clearprism_vtab_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info);
+int clearprism_vtab_filter(sqlite3_vtab_cursor *cur, int idxNum,
+                            const char *idxStr, int argc,
+                            sqlite3_value **argv);
+int clearprism_vtab_next(sqlite3_vtab_cursor *cur);
+int clearprism_vtab_eof(sqlite3_vtab_cursor *cur);
+int clearprism_vtab_column(sqlite3_vtab_cursor *cur, sqlite3_context *ctx,
+                            int iCol);
+int clearprism_vtab_rowid(sqlite3_vtab_cursor *cur, sqlite3_int64 *pRowid);
+
+/* clearprism_cache_l1.c */
+clearprism_l1_cache *clearprism_l1_create(int64_t max_rows, int64_t max_bytes,
+                                           int default_ttl_sec);
+void clearprism_l1_destroy(clearprism_l1_cache *l1);
+clearprism_l1_entry *clearprism_l1_lookup(clearprism_l1_cache *l1,
+                                            const char *key);
+int  clearprism_l1_insert(clearprism_l1_cache *l1, const char *key,
+                           clearprism_l1_row *rows, int n_rows,
+                           size_t byte_size);
+void clearprism_l1_evict_expired(clearprism_l1_cache *l1);
+
+/* clearprism_cache_l2.c */
+clearprism_l2_cache *clearprism_l2_create(const char *cache_db_path,
+                                           const char *target_table,
+                                           clearprism_col_def *cols, int nCol,
+                                           int refresh_interval_sec,
+                                           clearprism_registry *registry,
+                                           clearprism_connpool *pool,
+                                           char **errmsg);
+void clearprism_l2_destroy(clearprism_l2_cache *l2);
+int  clearprism_l2_start_refresh(clearprism_l2_cache *l2, char **errmsg);
+sqlite3_stmt *clearprism_l2_query(clearprism_l2_cache *l2,
+                                   const char *where_clause,
+                                   const char *source_alias,
+                                   char **errmsg);
+int  clearprism_l2_is_fresh(clearprism_l2_cache *l2);
+
+/* clearprism_cache.c */
+clearprism_cache *clearprism_cache_create(clearprism_l1_cache *l1,
+                                           clearprism_l2_cache *l2);
+void clearprism_cache_destroy(clearprism_cache *cache);
+int  clearprism_cache_lookup(clearprism_cache *cache, const char *key,
+                              clearprism_cache_cursor **out_cursor);
+void clearprism_cache_store_l1(clearprism_cache *cache, const char *key,
+                                clearprism_l1_row *rows, int n_rows,
+                                size_t byte_size);
+void clearprism_cache_cursor_free(clearprism_cache_cursor *cc);
+
+/* Cache cursor operations */
+int  clearprism_cache_cursor_next(clearprism_cache_cursor *cc);
+int  clearprism_cache_cursor_eof(clearprism_cache_cursor *cc);
+sqlite3_value *clearprism_cache_cursor_value(clearprism_cache_cursor *cc,
+                                              int iCol);
+
+#endif /* CLEARPRISM_H */
