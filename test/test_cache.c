@@ -11,19 +11,29 @@
 
 extern void test_report(const char *name, int passed);
 
-/* Helper: create an L1 row with integer values */
-static clearprism_l1_row *make_test_row(int val1, const char *val2, int n_values)
-{
-    clearprism_l1_row *row = sqlite3_malloc(sizeof(*row));
-    if (!row) return NULL;
-    memset(row, 0, sizeof(*row));
+/* Helper: create flat L1 row + values arrays (1 row) */
+struct test_l1_data {
+    clearprism_l1_row *rows;
+    sqlite3_value **all_values;
+    int n_values;
+};
 
-    row->n_values = n_values;
-    row->values = sqlite3_malloc(n_values * (int)sizeof(sqlite3_value *));
-    if (!row->values) {
-        sqlite3_free(row);
-        return NULL;
+static struct test_l1_data make_test_row(int val1, const char *val2, int n_values)
+{
+    struct test_l1_data d = {NULL, NULL, n_values};
+
+    d.rows = sqlite3_malloc(sizeof(clearprism_l1_row));
+    d.all_values = sqlite3_malloc(n_values * (int)sizeof(sqlite3_value *));
+    if (!d.rows || !d.all_values) {
+        sqlite3_free(d.rows); sqlite3_free(d.all_values);
+        d.rows = NULL; d.all_values = NULL;
+        return d;
     }
+    memset(d.rows, 0, sizeof(clearprism_l1_row));
+
+    d.rows->n_values = n_values;
+    d.rows->values = d.all_values;
+    d.rows->next = NULL;
 
     /* Create sqlite3_values using a dummy statement */
     sqlite3 *mem_db = NULL;
@@ -37,17 +47,16 @@ static clearprism_l1_row *make_test_row(int val1, const char *val2, int n_values
     sqlite3_step(stmt);
 
     for (int i = 0; i < n_values && i < 2; i++) {
-        row->values[i] = sqlite3_value_dup(sqlite3_column_value(stmt, i));
+        d.all_values[i] = sqlite3_value_dup(sqlite3_column_value(stmt, i));
     }
     /* Fill remaining with NULLs */
     for (int i = 2; i < n_values; i++) {
-        row->values[i] = sqlite3_value_dup(sqlite3_column_value(stmt, 0));
+        d.all_values[i] = sqlite3_value_dup(sqlite3_column_value(stmt, 0));
     }
 
     sqlite3_finalize(stmt);
     sqlite3_close(mem_db);
-    row->next = NULL;
-    return row;
+    return d;
 }
 
 static void test_l1_create_destroy(void)
@@ -67,14 +76,14 @@ static void test_l1_insert_lookup(void)
         return;
     }
 
-    clearprism_l1_row *row = make_test_row(42, "hello", 2);
-    if (!row) {
+    struct test_l1_data d = make_test_row(42, "hello", 2);
+    if (!d.rows) {
         test_report("l1_insert_lookup (make_row)", 0);
         clearprism_l1_destroy(l1);
         return;
     }
 
-    int rc = clearprism_l1_insert(l1, "test_key", row, 1, 64);
+    int rc = clearprism_l1_insert(l1, "test_key", d.rows, d.all_values, 1, 2, 64);
     test_report("l1_insert returns OK", rc == SQLITE_OK);
 
     clearprism_l1_entry *entry = clearprism_l1_lookup(l1, "test_key");
@@ -101,13 +110,13 @@ static void test_l1_eviction(void)
     }
 
     /* Insert 3 single-row entries — third should evict first */
-    clearprism_l1_row *r1 = make_test_row(1, "one", 2);
-    clearprism_l1_row *r2 = make_test_row(2, "two", 2);
-    clearprism_l1_row *r3 = make_test_row(3, "three", 2);
+    struct test_l1_data d1 = make_test_row(1, "one", 2);
+    struct test_l1_data d2 = make_test_row(2, "two", 2);
+    struct test_l1_data d3 = make_test_row(3, "three", 2);
 
-    clearprism_l1_insert(l1, "key1", r1, 1, 32);
-    clearprism_l1_insert(l1, "key2", r2, 1, 32);
-    clearprism_l1_insert(l1, "key3", r3, 1, 32);
+    clearprism_l1_insert(l1, "key1", d1.rows, d1.all_values, 1, 2, 32);
+    clearprism_l1_insert(l1, "key2", d2.rows, d2.all_values, 1, 2, 32);
+    clearprism_l1_insert(l1, "key3", d3.rows, d3.all_values, 1, 2, 32);
 
     /* key1 should have been evicted */
     clearprism_l1_entry *e1 = clearprism_l1_lookup(l1, "key1");
@@ -128,8 +137,8 @@ static void test_l1_ttl_expiry(void)
         return;
     }
 
-    clearprism_l1_row *row = make_test_row(99, "ttl", 2);
-    clearprism_l1_insert(l1, "ttl_key", row, 1, 32);
+    struct test_l1_data d = make_test_row(99, "ttl", 2);
+    clearprism_l1_insert(l1, "ttl_key", d.rows, d.all_values, 1, 2, 32);
 
     /* Should be present immediately */
     clearprism_l1_entry *e = clearprism_l1_lookup(l1, "ttl_key");
@@ -163,8 +172,8 @@ static void test_unified_cache(void)
         test_report("cache miss cursor is NULL", cc == NULL);
 
         /* Insert into L1 via cache facade */
-        clearprism_l1_row *row = make_test_row(7, "cached", 2);
-        clearprism_cache_store_l1(cache, "hit_key", row, 1, 32);
+        struct test_l1_data td = make_test_row(7, "cached", 2);
+        clearprism_cache_store_l1(cache, "hit_key", td.rows, td.all_values, 1, 2, 32);
 
         /* Lookup should hit */
         hit = clearprism_cache_lookup(cache, "hit_key", &cc);

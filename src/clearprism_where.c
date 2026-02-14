@@ -261,7 +261,8 @@ int clearprism_where_decode(const char *idx_str, clearprism_query_plan *plan)
  */
 char *clearprism_where_generate_sql(const char *table,
                                      clearprism_col_def *cols, int nCol,
-                                     clearprism_query_plan *plan)
+                                     clearprism_query_plan *plan,
+                                     int64_t pushdown_limit)
 {
     /* Build column list — prepend rowid for composite rowid encoding */
     size_t col_buf_size = 256;
@@ -414,6 +415,14 @@ char *clearprism_where_generate_sql(const char *table,
                                   col_list, table, order_by);
     } else {
         sql = clearprism_mprintf("SELECT %s FROM \"%s\"", col_list, table);
+    }
+
+    /* Append LIMIT to source SQL when pushdown is requested */
+    if (pushdown_limit > 0 && sql) {
+        char *with_limit = clearprism_mprintf("%s LIMIT %lld", sql,
+                                               (long long)pushdown_limit);
+        sqlite3_free(sql);
+        sql = with_limit;
     }
 
     sqlite3_free(col_list);

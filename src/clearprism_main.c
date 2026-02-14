@@ -51,7 +51,9 @@ static sqlite3_module clearprism_module = {
 
 #if SQLITE_CORE
 int clearprism_init(sqlite3 *db) {
-    return sqlite3_create_module(db, "clearprism", &clearprism_module, NULL);
+    int rc = sqlite3_create_module(db, "clearprism", &clearprism_module, NULL);
+    if (rc != SQLITE_OK) return rc;
+    return clearprism_register_agg_functions(db);
 }
 #endif
 
@@ -70,6 +72,16 @@ int sqlite3_clearprism_init(sqlite3 *db, char **pzErrMsg,
     if (rc != SQLITE_OK) {
         if (pzErrMsg) {
             *pzErrMsg = sqlite3_mprintf("clearprism: failed to register module: %s",
+                                         sqlite3_errmsg(db));
+        }
+        return rc;
+    }
+
+    /* Register aggregate pushdown functions */
+    rc = clearprism_register_agg_functions(db);
+    if (rc != SQLITE_OK) {
+        if (pzErrMsg) {
+            *pzErrMsg = sqlite3_mprintf("clearprism: failed to register aggregate functions: %s",
                                          sqlite3_errmsg(db));
         }
     }

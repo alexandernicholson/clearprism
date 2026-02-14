@@ -49,14 +49,17 @@ int clearprism_cache_lookup(clearprism_cache *cache, const char *key,
     if (cache->l1) {
         clearprism_l1_entry *entry = clearprism_l1_lookup(cache->l1, key);
         if (entry) {
-            /* Create a cache cursor serving from L1 data */
+            /* Create a cache cursor serving from flat L1 arrays */
             clearprism_cache_cursor *cc = sqlite3_malloc(sizeof(*cc));
             if (!cc) return 0;
             memset(cc, 0, sizeof(*cc));
             cc->rows = entry->rows;
-            cc->current_row = entry->rows;
+            cc->all_values = entry->all_values;
             cc->n_rows = entry->n_rows;
+            cc->n_values_per_row = entry->n_values_per_row;
             cc->current_idx = 0;
+            cc->current_rowid = (entry->n_rows > 0) ?
+                entry->rows[0].composite_rowid : 0;
             *out_cursor = cc;
             return 1;
         }
@@ -105,11 +108,14 @@ int clearprism_cache_lookup(clearprism_cache *cache, const char *key,
 }
 
 void clearprism_cache_store_l1(clearprism_cache *cache, const char *key,
-                                clearprism_l1_row *rows, int n_rows,
+                                clearprism_l1_row *rows,
+                                sqlite3_value **all_values,
+                                int n_rows, int n_values_per_row,
                                 size_t byte_size)
 {
     if (!cache || !cache->l1 || !key) return;
-    clearprism_l1_insert(cache->l1, key, rows, n_rows, byte_size);
+    clearprism_l1_insert(cache->l1, key, rows, all_values,
+                          n_rows, n_values_per_row, byte_size);
 }
 
 void clearprism_cache_cursor_free(clearprism_cache_cursor *cc)
@@ -136,10 +142,10 @@ int clearprism_cache_cursor_next(clearprism_cache_cursor *cc)
         return SQLITE_OK;
     }
 
-    /* L1 path */
-    if (cc->current_row) {
-        cc->current_row = cc->current_row->next;
-        cc->current_idx++;
+    /* L1 path — flat array indexed access */
+    cc->current_idx++;
+    if (cc->current_idx < cc->n_rows) {
+        cc->current_rowid = cc->rows[cc->current_idx].composite_rowid;
     }
     return SQLITE_OK;
 }
@@ -153,8 +159,8 @@ int clearprism_cache_cursor_eof(clearprism_cache_cursor *cc)
         return 0;  /* We rely on next() returning DONE */
     }
 
-    /* L1 path */
-    return cc->current_row == NULL;
+    /* L1 path — flat array bounds check */
+    return cc->current_idx >= cc->n_rows;
 }
 
 sqlite3_value *clearprism_cache_cursor_value(clearprism_cache_cursor *cc, int iCol)
@@ -166,9 +172,10 @@ sqlite3_value *clearprism_cache_cursor_value(clearprism_cache_cursor *cc, int iC
         return sqlite3_column_value(cc->l2_stmt, iCol);
     }
 
-    /* L1 path */
-    if (cc->current_row && iCol >= 0 && iCol < cc->current_row->n_values) {
-        return cc->current_row->values[iCol];
+    /* L1 path — flat array indexed access */
+    if (cc->all_values && cc->current_idx < cc->n_rows &&
+        iCol >= 0 && iCol < cc->n_values_per_row) {
+        return cc->all_values[cc->current_idx * cc->n_values_per_row + iCol];
     }
 
     return NULL;

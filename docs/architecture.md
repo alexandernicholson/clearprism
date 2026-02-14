@@ -80,36 +80,40 @@ classDiagram
         clearprism_vtab* vtab
         clearprism_source* sources
         int n_sources
-        int current_source_idx
-        sqlite3* current_conn
-        sqlite3_stmt* current_stmt
+        clearprism_source_handle* handles
+        int n_handles
+        int current_handle_idx
         clearprism_query_plan plan
         sqlite3_value** saved_argv
         int64_t row_counter
         int eof
         int serving_from_cache
+        int* heap
+        int heap_size
     }
     clearprism_vtab "1" --> "*" clearprism_cursor
 ```
 
 ### clearprism_cursor
 
-One instance per active scan (per `SELECT` statement). Manages iteration across multiple source databases sequentially. Key fields:
+One instance per active scan (per `SELECT` statement). Manages iteration across multiple source databases. Key fields:
 
 | Field | Purpose |
 |-------|---------|
 | `sources` | Immutable snapshot of active sources taken at `xFilter` time |
-| `current_source_idx` | Which source database is currently being read |
-| `current_stmt` | Active `sqlite3_stmt` on the current source |
+| `handles` | Array of `clearprism_source_handle` — one per source, prepared in parallel |
+| `current_handle_idx` | Index into `handles[]` for the current source |
+| `heap` / `heap_size` | Min-heap of handle indices for merge-sort ORDER BY |
 | `saved_argv` | Deep copies of `xFilter` argv for re-binding across sources |
-| `row_counter` | Monotonically increasing counter (used for cache-served rowids) |
+| `row_counter` | Monotonically increasing counter |
 | `serving_from_cache` | Flag indicating results are coming from L1 cache |
 | `limit_remaining` | Rows left to return before LIMIT is satisfied (-1 = no limit) |
 | `offset_remaining` | Rows left to skip for OFFSET (0 = no offset) |
 | `in_values` / `in_counts` | Expanded IN constraint values for binding across sources |
 | `cache_key` | Key for storing live query results into L1 cache |
+| `alias_values` | Pre-created `sqlite3_value*` for each source's alias (avoids per-row DB open) |
 | `buffer_head/tail` | Linked list of rows buffered during live query for L1 population |
-| `buffer_overflow` | Set when result set exceeds per-query L1 budget (25% of max) |
+| `buffer_overflow` | Set when result set exceeds L1 budget |
 
 ## Query Execution Flow
 
@@ -123,10 +127,10 @@ Called by SQLite's query planner (potentially multiple times) to determine scan 
 4. Detects `LIMIT` and `OFFSET` constraints for pushdown
 5. Detects `IN` constraints via `sqlite3_vtab_in()` (SQLite 3.38.0+)
 6. Detects `rowid = ?` for composite rowid lookup (cost = 1.0)
-7. Checks if ORDER BY can be consumed (single-source queries only)
+7. Checks if ORDER BY can be consumed (single-source: direct pushdown, multi-source: merge-sort)
 8. Encodes plan into `idxStr` as pipe-delimited `colIdx:op[I]` pairs, with optional `#col:dir` ORDER BY section
 9. Sets `idxNum` bitmask with `CLEARPRISM_PLAN_*` flags
-10. Estimates cost based on number of sources and constraint selectivity
+10. Estimates cost based on actual registry source count and constraint selectivity
 
 ### xFilter (Scan Start)
 
@@ -193,18 +197,24 @@ For real columns: returns the value from the current `sqlite3_stmt` or cache cur
 
 For the hidden `_source_db` column (index `nCol`): returns the alias of the current source database.
 
-### Source-by-Source Iteration
+**Cache serving path**: When `serving_from_cache` is set, xColumn uses type-specific `sqlite3_result_*` functions with `SQLITE_STATIC` for text/blob values instead of `sqlite3_result_value()`. This avoids a deep copy per column per row — the cached `sqlite3_value` objects are stable for the duration of the query, making `SQLITE_STATIC` safe. This zero-copy approach is critical for cache serving performance.
 
-Clearprism iterates sources sequentially. For each source, it:
+### Parallel Source Preparation
+
+At `xFilter` time, all sources are prepared in parallel using a thread pool (up to 16 worker threads). Each thread:
 
 1. Checks out a connection from the pool
 2. Prepares a `SELECT` with pushed-down WHERE constraints
 3. Binds parameter values from `saved_argv`
-4. Steps through all rows
-5. Finalizes the statement and checks the connection back in
-6. Moves to the next source
+4. Steps to the first row
 
-This means results are ordered by source priority first, then by whatever order each source database returns rows.
+After all threads complete, the cursor iterates through pre-prepared handles. Sources that fail to connect or prepare are silently skipped (resilient behavior).
+
+If the number of sources exceeds the configured `pool_max_open`, the pool limit is automatically raised to accommodate all simultaneous connections. This prevents timeout-induced stalls when federating across many databases.
+
+### Merge-Sort ORDER BY
+
+For multi-source `ORDER BY` queries, each source's SQL includes the `ORDER BY` clause. A min-heap over the source handles produces globally sorted output by repeatedly extracting the minimum element and stepping that source forward. This avoids materializing all rows before sorting.
 
 ## WHERE Pushdown
 
@@ -246,7 +256,9 @@ Supported constraint operators:
 
 **IN pushdown** (SQLite 3.38.0+): When `sqlite3_vtab_in()` detects an IN constraint, values are expanded via `sqlite3_vtab_in_first()/next()` and bound as `col IN (?,?,?)`.
 
-**ORDER BY pushdown**: When the query targets a single source (`_source_db = ?`), ORDER BY is consumed and pushed to the source SQL. Multi-source ORDER BY is handled by SQLite post-sort.
+**ORDER BY pushdown**: ORDER BY is consumed and pushed to each source's SQL. For single-source queries, the source returns rows in order directly. For multi-source queries, a min-heap merge-sort combines pre-sorted results from all sources into globally sorted output.
+
+**LIKE ESCAPE**: `LIKE pattern ESCAPE char` queries work correctly, but the ESCAPE character is not forwarded to source databases. SQLite's `xBestIndex` API does not expose the ESCAPE character — only the LIKE pattern is available. The query still produces correct results because SQLite applies the ESCAPE evaluation as a post-filter (Clearprism never sets `omit=1` for LIKE constraints).
 
 **Composite rowids**: `WHERE rowid = ?` is detected and handled as a single-row lookup by decoding `(source_id << 40) | source_rowid`, finding the source, and querying `WHERE rowid = ?` on that source.
 
@@ -291,3 +303,54 @@ All memory allocation goes through `sqlite3_malloc()` / `sqlite3_free()` to part
 - **Byte size**: `l1_max_bytes` (default 64 MiB)
 
 Cached rows store deep copies of `sqlite3_value` objects via `sqlite3_value_dup()`, freed with `sqlite3_value_free()` on eviction.
+
+## Performance
+
+Clearprism is optimized for read-heavy federated workloads. Key performance characteristics:
+
+### L1 Cache Design
+
+The L1 cache stores query results in **flat contiguous arrays** for optimal iteration performance:
+
+```mermaid
+graph LR
+    ENTRY["L1 Entry"] --> ROWS["clearprism_l1_row[]<br>(contiguous array)"]
+    ENTRY --> VALUES["sqlite3_value*[]<br>(flat n_rows × n_cols)"]
+    ROWS -.->|"rows[i].values ="| VALUES
+```
+
+- **Flat row array**: All `clearprism_l1_row` structs are allocated in a single contiguous block. This enables sequential memory access during iteration, eliminating linked-list pointer chasing.
+- **Flat values array**: All `sqlite3_value*` pointers across all rows are stored in a single contiguous array. Row `i`, column `j` is accessed as `all_values[i * n_values_per_row + j]`, giving the CPU prefetcher a sequential access pattern.
+- **Zero-copy serving**: The `xColumn` cache path uses `SQLITE_STATIC` with type-specific `sqlite3_result_*` calls, avoiding the deep copy that `sqlite3_result_value()` performs.
+- **Buffer-then-flatten**: During live queries, rows are buffered in a linked list (for efficient append). On query completion, the linked list is linearized into flat arrays before storing in L1.
+
+### Alias Value Pre-creation
+
+The hidden `_source_db` column returns each source's alias string. Creating a `sqlite3_value` from a string requires a SQLite prepared statement. To avoid opening a `:memory:` database per row, alias values are pre-created once per `xFilter` call: a single `:memory:` DB creates `sqlite3_value*` for each source, which are then reused via `sqlite3_value_dup()` during L1 buffering.
+
+### Performance Profile
+
+Measured on a typical workload (10 sources, 1K rows each, indexed category filter):
+
+| Operation | Latency | vs Direct SQLite |
+|-----------|---------|-----------------|
+| Direct SQLite (manual 10-source federation) | 2.28ms | baseline |
+| Clearprism live query (first, cold) | ~2.3ms | 1.0x |
+| Clearprism cached query (warm L1) | 61us | **37x faster** |
+| Direct SQLite (single-source full scan, 10K rows) | 4.1ms | baseline |
+| Clearprism cached full scan (10K rows) | 4.6ms | 0.9x |
+| Single-source indexed lookup (cached) | 7us | — |
+
+Cache hit rates dominate real-world performance. For repeated query patterns (dashboards, reports, API serving), the L1 cache delivers 30-70x speedup over manual multi-source federation.
+
+### Benchmarking
+
+Run `make bench` to execute the full benchmark suite:
+
+```bash
+make bench                          # run all 7 scenarios (~60s)
+./clearprism_bench baseline         # run one scenario
+./clearprism_bench source_scale     # run one scenario
+```
+
+Scenarios: `baseline`, `source_scale`, `cache`, `where`, `orderby`, `row_scale`, `concurrent`. Results are appended to `bench_results.csv` for tracking across runs.

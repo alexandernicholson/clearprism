@@ -99,7 +99,9 @@ clearprism_l1_entry *clearprism_l1_lookup(clearprism_l1_cache *l1, const char *k
 }
 
 int clearprism_l1_insert(clearprism_l1_cache *l1, const char *key,
-                          clearprism_l1_row *rows, int n_rows,
+                          clearprism_l1_row *rows,
+                          sqlite3_value **all_values,
+                          int n_rows, int n_values_per_row,
                           size_t byte_size)
 {
     if (!l1 || !key) return SQLITE_ERROR;
@@ -145,7 +147,9 @@ int clearprism_l1_insert(clearprism_l1_cache *l1, const char *key,
     entry->key_hash = hash;
     entry->key_str = clearprism_strdup(key);
     entry->rows = rows;
+    entry->all_values = all_values;
     entry->n_rows = n_rows;
+    entry->n_values_per_row = n_values_per_row;
     entry->byte_size = byte_size;
     entry->created_at = time(NULL);
     entry->ttl_sec = l1->default_ttl_sec;
@@ -192,18 +196,15 @@ static void l1_entry_free(clearprism_l1_entry *entry)
     if (!entry) return;
     sqlite3_free(entry->key_str);
 
-    clearprism_l1_row *row = entry->rows;
-    while (row) {
-        clearprism_l1_row *next = row->next;
-        if (row->values) {
-            for (int i = 0; i < row->n_values; i++) {
-                sqlite3_value_free(row->values[i]);
-            }
-            sqlite3_free(row->values);
-        }
-        sqlite3_free(row);
-        row = next;
+    /* Free all sqlite3_value objects from the flat values array */
+    if (entry->all_values) {
+        int total = entry->n_rows * entry->n_values_per_row;
+        for (int i = 0; i < total; i++)
+            sqlite3_value_free(entry->all_values[i]);
+        sqlite3_free(entry->all_values);
     }
+    /* Free the flat row array (row structs only, values already freed above) */
+    sqlite3_free(entry->rows);
 
     sqlite3_free(entry);
 }

@@ -197,14 +197,64 @@ static int vtab_discover_schema(clearprism_vtab *vtab, char **pzErr)
     }
     sqlite3_finalize(stmt);
     sqlite3_close(src_db);
-    clearprism_sources_free(sources, n_sources);
 
     if (vtab->nCol == 0) {
         *pzErr = clearprism_mprintf(
             "clearprism: table '%s' has no columns or doesn't exist in source",
             vtab->target_table);
+        clearprism_sources_free(sources, n_sources);
         return SQLITE_ERROR;
     }
+
+    /* Validate schema across all other sources */
+    for (int s = 1; s < n_sources; s++) {
+        sqlite3 *check_db = NULL;
+        int rc2 = sqlite3_open_v2(sources[s].path, &check_db,
+                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+        if (rc2 != SQLITE_OK) {
+            sqlite3_close(check_db);
+            continue;  /* source unavailable — skip validation */
+        }
+
+        char *check_sql = clearprism_mprintf("PRAGMA table_info(\"%s\")",
+                                              vtab->target_table);
+        sqlite3_stmt *check_stmt = NULL;
+        rc2 = sqlite3_prepare_v2(check_db, check_sql, -1, &check_stmt, NULL);
+        sqlite3_free(check_sql);
+
+        if (rc2 != SQLITE_OK) {
+            sqlite3_close(check_db);
+            continue;  /* table may not exist — skip */
+        }
+
+        int col_idx = 0;
+        int mismatch = 0;
+        while (sqlite3_step(check_stmt) == SQLITE_ROW) {
+            const char *col_name = (const char *)sqlite3_column_text(check_stmt, 1);
+            if (col_idx >= vtab->nCol) { mismatch = 1; break; }
+            if (!col_name || strcmp(col_name, vtab->cols[col_idx].name) != 0) {
+                mismatch = 1;
+                break;
+            }
+            col_idx++;
+        }
+        if (col_idx != vtab->nCol) mismatch = 1;
+
+        sqlite3_finalize(check_stmt);
+        sqlite3_close(check_db);
+
+        if (mismatch) {
+            *pzErr = clearprism_mprintf(
+                "clearprism: schema mismatch in source '%s' (alias '%s') — "
+                "expected %d columns matching '%s'",
+                sources[s].path, sources[s].alias,
+                vtab->nCol, sources[0].alias);
+            clearprism_sources_free(sources, n_sources);
+            return SQLITE_ERROR;
+        }
+    }
+
+    clearprism_sources_free(sources, n_sources);
 
     /* Build CREATE TABLE SQL for sqlite3_declare_vtab */
     size_t sql_size = 256;
@@ -320,6 +370,9 @@ static int vtab_init(sqlite3 *db, int argc, const char *const *argv,
         return rc;
     }
 
+    /* Register vtab in global map for aggregate function lookup */
+    clearprism_register_vtab(vtab->target_table, vtab);
+
     *ppVtab = &vtab->base;
     return SQLITE_OK;
 }
@@ -343,6 +396,10 @@ int clearprism_vtab_connect(sqlite3 *db, void *pAux, int argc,
 static void vtab_free(clearprism_vtab *vtab)
 {
     if (!vtab) return;
+
+    /* Unregister from global vtab map */
+    if (vtab->target_table)
+        clearprism_unregister_vtab(vtab->target_table);
 
     if (vtab->cache) clearprism_cache_destroy(vtab->cache);
     if (vtab->pool) clearprism_connpool_destroy(vtab->pool);
@@ -392,17 +449,20 @@ int clearprism_vtab_close(sqlite3_vtab_cursor *pCur)
 {
     clearprism_cursor *cur = (clearprism_cursor *)pCur;
 
-    /* Finalize any open statement */
-    if (cur->current_stmt) {
-        sqlite3_finalize(cur->current_stmt);
+    /* Clean up all source handles (finalize stmts, checkin connections) */
+    if (cur->handles) {
+        for (int i = 0; i < cur->n_handles; i++) {
+            clearprism_source_handle *h = &cur->handles[i];
+            if (h->stmt) sqlite3_finalize(h->stmt);
+            if (h->conn && cur->sources && h->source_idx < cur->n_sources)
+                clearprism_connpool_checkin(cur->vtab->pool,
+                                            cur->sources[h->source_idx].path);
+        }
+        sqlite3_free(cur->handles);
     }
 
-    /* Check in any checked-out connection */
-    if (cur->current_conn && cur->sources &&
-        cur->current_source_idx < cur->n_sources) {
-        clearprism_connpool_checkin(cur->vtab->pool,
-                                    cur->sources[cur->current_source_idx].path);
-    }
+    /* Free merge-sort heap */
+    sqlite3_free(cur->heap);
 
     /* Free query plan */
     clearprism_query_plan_clear(&cur->plan);
@@ -433,22 +493,37 @@ int clearprism_vtab_close(sqlite3_vtab_cursor *pCur)
     sqlite3_free(cur->in_offsets);
     sqlite3_free(cur->in_counts);
 
-    /* Free L1 population buffer */
+    /* Free pre-created alias values */
+    if (cur->alias_values) {
+        for (int i = 0; i < cur->n_sources; i++)
+            sqlite3_value_free(cur->alias_values[i]);
+        sqlite3_free(cur->alias_values);
+    }
+
+    /* Free pre-generated SQL */
+    sqlite3_free(cur->cached_sql);
+    sqlite3_free(cur->cached_fallback_sql);
+
+    /* Free L1 population buffer (pre-allocated flat arrays) */
     {
-        clearprism_l1_row *row = cur->buffer_head;
-        while (row) {
-            clearprism_l1_row *next = row->next;
-            if (row->values) {
-                for (int i = 0; i < row->n_values; i++) {
-                    sqlite3_value_free(row->values[i]);
-                }
-                sqlite3_free(row->values);
-            }
-            sqlite3_free(row);
-            row = next;
+        if (cur->buf_values) {
+            int total = cur->buffer_n_rows * cur->buf_n_cols;
+            for (int i = 0; i < total; i++)
+                sqlite3_value_free(cur->buf_values[i]);
+            sqlite3_free(cur->buf_values);
         }
+        sqlite3_free(cur->buf_rows);
         sqlite3_free(cur->cache_key);
     }
+
+    /* Free parallel drain buffers */
+    if (cur->drain_values) {
+        int total = cur->drain_n_rows * cur->drain_n_cols;
+        for (int i = 0; i < total; i++)
+            sqlite3_value_free(cur->drain_values[i]);
+        sqlite3_free(cur->drain_values);
+    }
+    sqlite3_free(cur->drain_rows);
 
     sqlite3_free(cur);
     return SQLITE_OK;

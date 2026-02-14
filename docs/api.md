@@ -292,7 +292,9 @@ Tries L1 first, then L2. Returns 1 on hit (with `*out_cursor` set), 0 on miss.
 
 ```c
 void clearprism_cache_store_l1(clearprism_cache *cache, const char *key,
-                                clearprism_l1_row *rows, int n_rows,
+                                clearprism_l1_row *rows,
+                                sqlite3_value **all_values,
+                                int n_rows, int n_values_per_row,
                                 size_t byte_size);
 ```
 
