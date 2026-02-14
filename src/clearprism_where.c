@@ -35,8 +35,17 @@ char *clearprism_where_encode(sqlite3_index_info *info, int nCol, int *out_flags
         int col = info->aConstraint[i].iColumn;
         int op = info->aConstraint[i].op;
 
-        /* Skip rowid constraints (iColumn == -1) — handled in xBestIndex */
+        /* Skip rowid constraints (iColumn == -1) — handled in xBestIndex.
+         * But don't skip LIMIT/OFFSET constraints which also have col < 0. */
+#ifdef SQLITE_INDEX_CONSTRAINT_LIMIT
+        if (col < 0 && op != SQLITE_INDEX_CONSTRAINT_LIMIT
+#ifdef SQLITE_INDEX_CONSTRAINT_OFFSET
+            && op != SQLITE_INDEX_CONSTRAINT_OFFSET
+#endif
+        ) continue;
+#else
         if (col < 0) continue;
+#endif
 
         /* Only push down supported operations */
         switch (op) {

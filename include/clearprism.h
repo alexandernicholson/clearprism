@@ -286,6 +286,11 @@ struct clearprism_cursor {
     int                 current_handle_idx;
     int                 lazy_prepare;      /* 1 = prepare sources on demand */
 
+    /* Background source prefetch (overlaps prepare with iteration) */
+    pthread_t           prefetch_thread;
+    int                 prefetch_next_idx;  /* handle index being prefetched */
+    int                 prefetch_active;    /* 1 if prefetch thread is running */
+
     /* Query plan */
     clearprism_query_plan plan;
 
@@ -403,6 +408,7 @@ int clearprism_vtab_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor);
 int clearprism_vtab_close(sqlite3_vtab_cursor *cur);
 
 /* clearprism_query.c */
+void clearprism_cursor_flush_drain(clearprism_cursor *cur);
 int clearprism_vtab_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info);
 int clearprism_vtab_filter(sqlite3_vtab_cursor *cur, int idxNum,
                             const char *idxStr, int argc,

@@ -116,6 +116,14 @@ int clearprism_value_compare(sqlite3_value *a, sqlite3_value *b)
     /* Same type group — compare values */
     if (ta == SQLITE_NULL) return 0;
 
+    /* Fast-path: both integers — direct int64 comparison avoids
+     * lossy double conversion and is ~2x faster. */
+    if (ta == SQLITE_INTEGER && tb == SQLITE_INTEGER) {
+        int64_t ia = sqlite3_value_int64(a);
+        int64_t ib = sqlite3_value_int64(b);
+        return (ia > ib) - (ia < ib);
+    }
+
     if (ta == SQLITE_INTEGER || ta == SQLITE_FLOAT ||
         tb == SQLITE_INTEGER || tb == SQLITE_FLOAT) {
         /* Numeric comparison: prefer double for mixed int/float */

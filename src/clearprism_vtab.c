@@ -449,6 +449,12 @@ int clearprism_vtab_close(sqlite3_vtab_cursor *pCur)
 {
     clearprism_cursor *cur = (clearprism_cursor *)pCur;
 
+    /* Join any active prefetch thread before freeing handles */
+    if (cur->prefetch_active) {
+        pthread_join(cur->prefetch_thread, NULL);
+        cur->prefetch_active = 0;
+    }
+
     /* Clean up all source handles (finalize stmts, checkin connections) */
     if (cur->handles) {
         for (int i = 0; i < cur->n_handles; i++) {
@@ -504,26 +510,18 @@ int clearprism_vtab_close(sqlite3_vtab_cursor *pCur)
     sqlite3_free(cur->cached_sql);
     sqlite3_free(cur->cached_fallback_sql);
 
-    /* Free L1 population buffer (pre-allocated flat arrays) */
-    {
-        if (cur->buf_values) {
-            int total = cur->buffer_n_rows * cur->buf_n_cols;
-            for (int i = 0; i < total; i++)
-                sqlite3_value_free(cur->buf_values[i]);
-            sqlite3_free(cur->buf_values);
-        }
-        sqlite3_free(cur->buf_rows);
-        sqlite3_free(cur->cache_key);
-    }
+    /* Flush drain to L1 cache then free drain buffers (uses cache_key) */
+    clearprism_cursor_flush_drain(cur);
 
-    /* Free parallel drain buffers */
-    if (cur->drain_values) {
-        int total = cur->drain_n_rows * cur->drain_n_cols;
+    /* Free L1 population buffer (pre-allocated flat arrays) */
+    if (cur->buf_values) {
+        int total = cur->buffer_n_rows * cur->buf_n_cols;
         for (int i = 0; i < total; i++)
-            sqlite3_value_free(cur->drain_values[i]);
-        sqlite3_free(cur->drain_values);
+            sqlite3_value_free(cur->buf_values[i]);
+        sqlite3_free(cur->buf_values);
     }
-    sqlite3_free(cur->drain_rows);
+    sqlite3_free(cur->buf_rows);
+    sqlite3_free(cur->cache_key);
 
     sqlite3_free(cur);
     return SQLITE_OK;

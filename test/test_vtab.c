@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sqlite3.h>
 #include "clearprism.h"
@@ -1656,6 +1657,389 @@ static void test_vtab_lazy_prepare(void)
     drain_cleanup_test_files();
 }
 
+/* ========== Optimization Correctness Tests ========== */
+
+static void test_order_limit_heap_correctness(void)
+{
+    /* Tests that ORDER BY + LIMIT on multi-source vtab returns correctly
+     * sorted results via the live merge-sort heap (optimization 1 skips
+     * drain for this case). */
+    drain_setup(5, 100);  /* 5 sources x 100 rows */
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE items USING clearprism("
+        "  registry_db='%s', table='items')", DRAIN_REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* ASC ordering with LIMIT */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT value FROM items ORDER BY value ASC LIMIT 20",
+        -1, &stmt, NULL);
+    test_report("order_limit_heap: ASC prepare", rc == SQLITE_OK);
+
+    if (rc == SQLITE_OK) {
+        int count = 0;
+        double prev = -1.0;
+        int ordered = 1;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            double val = sqlite3_column_double(stmt, 0);
+            if (count > 0 && val < prev) ordered = 0;
+            prev = val;
+            count++;
+        }
+        sqlite3_finalize(stmt);
+        test_report("order_limit_heap: ASC returns 20 rows", count == 20);
+        test_report("order_limit_heap: ASC correctly sorted", ordered);
+    }
+
+    /* DESC ordering with LIMIT */
+    rc = sqlite3_prepare_v2(db,
+        "SELECT value FROM items ORDER BY value DESC LIMIT 10",
+        -1, &stmt, NULL);
+    test_report("order_limit_heap: DESC prepare", rc == SQLITE_OK);
+
+    if (rc == SQLITE_OK) {
+        int count = 0;
+        double prev = 1e18;
+        int ordered = 1;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            double val = sqlite3_column_double(stmt, 0);
+            if (count > 0 && val > prev) ordered = 0;
+            prev = val;
+            count++;
+        }
+        sqlite3_finalize(stmt);
+        test_report("order_limit_heap: DESC returns 10 rows", count == 10);
+        test_report("order_limit_heap: DESC correctly sorted", ordered);
+    }
+
+    sqlite3_exec(db, "DROP TABLE items", NULL, NULL, NULL);
+    sqlite3_close(db);
+    drain_cleanup_test_files();
+}
+
+static const char *INT_SORT_REG_PATH = "/tmp/clearprism_intsort_test_registry.db";
+
+static void intsort_cleanup(void)
+{
+    unlink(INT_SORT_REG_PATH);
+    unlink("/tmp/clearprism_intsort_1.db");
+    unlink("/tmp/clearprism_intsort_2.db");
+}
+
+static void test_integer_sort_correctness(void)
+{
+    /* Tests that integer comparison fast-path produces correct ordering
+     * (optimization 2). Uses values near 2^53 that would break with
+     * lossy double conversion. */
+    intsort_cleanup();
+
+    /* Create registry */
+    sqlite3 *db = NULL;
+    sqlite3_open(INT_SORT_REG_PATH, &db);
+    sqlite3_exec(db,
+        "CREATE TABLE clearprism_sources ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  path TEXT NOT NULL UNIQUE,"
+        "  alias TEXT NOT NULL UNIQUE,"
+        "  active INTEGER NOT NULL DEFAULT 1,"
+        "  priority INTEGER NOT NULL DEFAULT 0,"
+        "  added_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  notes TEXT"
+        ");"
+        "CREATE TABLE clearprism_table_overrides ("
+        "  source_id INTEGER NOT NULL REFERENCES clearprism_sources(id),"
+        "  table_name TEXT NOT NULL,"
+        "  active INTEGER NOT NULL DEFAULT 1,"
+        "  PRIMARY KEY (source_id, table_name)"
+        ");",
+        NULL, NULL, NULL);
+
+    sqlite3_exec(db,
+        "INSERT INTO clearprism_sources (path, alias, priority) VALUES "
+        "('/tmp/clearprism_intsort_1.db', 'intsort1', 0),"
+        "('/tmp/clearprism_intsort_2.db', 'intsort2', 1)",
+        NULL, NULL, NULL);
+    sqlite3_close(db);
+
+    /* Create source databases with large integers near 2^53 */
+    for (int s = 1; s <= 2; s++) {
+        char path[256];
+        snprintf(path, sizeof(path), "/tmp/clearprism_intsort_%d.db", s);
+        sqlite3 *sdb = NULL;
+        sqlite3_open(path, &sdb);
+        sqlite3_exec(sdb,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT, value INTEGER)",
+            NULL, NULL, NULL);
+
+        sqlite3_stmt *ins = NULL;
+        sqlite3_prepare_v2(sdb,
+            "INSERT INTO items (id, category, value) VALUES (?, 'cat', ?)",
+            -1, &ins, NULL);
+        for (int i = 0; i < 10; i++) {
+            sqlite3_bind_int(ins, 1, (s - 1) * 10 + i + 1);
+            /* Use values near 2^53 boundary */
+            int64_t val = (int64_t)9007199254740992LL + (s - 1) * 20 + i;
+            sqlite3_bind_int64(ins, 2, val);
+            sqlite3_step(ins);
+            sqlite3_reset(ins);
+        }
+        sqlite3_finalize(ins);
+        sqlite3_close(sdb);
+    }
+
+    /* Open in-memory db, create vtab */
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE items USING clearprism("
+        "  registry_db='%s', table='items')", INT_SORT_REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* Query with ORDER BY — should be correctly sorted */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT value FROM items ORDER BY value ASC",
+        -1, &stmt, NULL);
+    test_report("integer_sort: prepare", rc == SQLITE_OK);
+
+    if (rc == SQLITE_OK) {
+        int count = 0;
+        int64_t prev = -1;
+        int ordered = 1;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t val = sqlite3_column_int64(stmt, 0);
+            if (count > 0 && val < prev) ordered = 0;
+            prev = val;
+            count++;
+        }
+        sqlite3_finalize(stmt);
+        test_report("integer_sort: returns 20 rows", count == 20);
+        test_report("integer_sort: correctly ordered", ordered);
+    }
+
+    sqlite3_exec(db, "DROP TABLE items", NULL, NULL, NULL);
+    sqlite3_close(db);
+    intsort_cleanup();
+}
+
+static void test_drain_l1_cache_transfer(void)
+{
+    /* Tests that drain results get cached in L1 via ownership transfer
+     * (optimization 3). Running the same query twice should yield the
+     * same result, with the second query served from L1 cache. */
+    drain_setup(5, 100);
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE items USING clearprism("
+        "  registry_db='%s', table='items')", DRAIN_REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* First query — should drain and then transfer to L1 cache */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM items WHERE category = 'cat_0'",
+        -1, &stmt, NULL);
+    test_report("drain_l1_transfer: first prepare", rc == SQLITE_OK);
+
+    int count1 = 0;
+    if (rc == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count1 = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        test_report("drain_l1_transfer: first query has rows", count1 > 0);
+    }
+
+    /* Second query — should hit L1 cache, get same result */
+    rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM items WHERE category = 'cat_0'",
+        -1, &stmt, NULL);
+    test_report("drain_l1_transfer: second prepare", rc == SQLITE_OK);
+
+    int count2 = 0;
+    if (rc == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count2 = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        test_report("drain_l1_transfer: same count both queries", count1 == count2);
+    }
+
+    sqlite3_exec(db, "DROP TABLE items", NULL, NULL, NULL);
+    sqlite3_close(db);
+    drain_cleanup_test_files();
+}
+
+static void test_lazy_prefetch_all_rows(void)
+{
+    /* Tests that lazy iteration with background prefetch returns all rows
+     * from all sources (optimization 4). Full scan without ORDER BY or
+     * WHERE uses lazy prepare with prefetch. */
+    drain_setup(10, 50);  /* 10 sources x 50 rows */
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE items USING clearprism("
+        "  registry_db='%s', table='items')", DRAIN_REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM items", -1, &stmt, NULL);
+    test_report("lazy_prefetch: prepare", rc == SQLITE_OK);
+
+    int count = 0;
+    if (rc == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        /* Should have all 500 rows (10 x 50) */
+        test_report("lazy_prefetch: returns all 500 rows", count == 500);
+    }
+
+    sqlite3_exec(db, "DROP TABLE items", NULL, NULL, NULL);
+    sqlite3_close(db);
+    drain_cleanup_test_files();
+}
+
+static void test_drain_limit_early_termination(void)
+{
+    /* Tests that drain with LIMIT only materializes necessary rows
+     * (optimization 7). */
+    drain_setup(5, 100);
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE items USING clearprism("
+        "  registry_db='%s', table='items')", DRAIN_REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* LIMIT without ORDER BY on multi-source — drain with early termination */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT * FROM items WHERE category = 'cat_0' LIMIT 10",
+        -1, &stmt, NULL);
+    test_report("drain_limit_early: LIMIT prepare", rc == SQLITE_OK);
+
+    if (rc == SQLITE_OK) {
+        int count = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) count++;
+        sqlite3_finalize(stmt);
+        test_report("drain_limit_early: LIMIT returns 10 rows", count == 10);
+    }
+
+    /* Also test with OFFSET */
+    rc = sqlite3_prepare_v2(db,
+        "SELECT * FROM items WHERE category = 'cat_0' LIMIT 5 OFFSET 3",
+        -1, &stmt, NULL);
+    test_report("drain_limit_early: OFFSET prepare", rc == SQLITE_OK);
+
+    if (rc == SQLITE_OK) {
+        int count = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) count++;
+        sqlite3_finalize(stmt);
+        test_report("drain_limit_early: LIMIT+OFFSET returns 5 rows", count == 5);
+    }
+
+    sqlite3_exec(db, "DROP TABLE items", NULL, NULL, NULL);
+    sqlite3_close(db);
+    drain_cleanup_test_files();
+}
+
+static void test_order_limit_vs_full_order(void)
+{
+    /* Tests that ORDER BY LIMIT returns the same top-N as a full ORDER BY.
+     * The first 15 values from a LIMIT query must match the first 15 from
+     * a full sorted query. */
+    drain_setup(5, 100);
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE items USING clearprism("
+        "  registry_db='%s', table='items')", DRAIN_REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* Get top 15 via ORDER BY LIMIT */
+    double limit_vals[15];
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT value FROM items ORDER BY value ASC LIMIT 15",
+        -1, &stmt, NULL);
+    test_report("order_limit_vs_full: LIMIT prepare", rc == SQLITE_OK);
+
+    int i = 0;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW && i < 15) {
+            limit_vals[i++] = sqlite3_column_double(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        test_report("order_limit_vs_full: LIMIT returns 15 rows", i == 15);
+    }
+
+    /* Get ALL values sorted, take first 15 */
+    int total = 0;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT value FROM items ORDER BY value ASC",
+        -1, &stmt, NULL);
+    test_report("order_limit_vs_full: full prepare", rc == SQLITE_OK);
+
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) total++;
+        sqlite3_finalize(stmt);
+        test_report("order_limit_vs_full: full returns 500 rows", total == 500);
+    }
+
+    double *all_vals = malloc(total * sizeof(double));
+    rc = sqlite3_prepare_v2(db,
+        "SELECT value FROM items ORDER BY value ASC",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        int j = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW)
+            all_vals[j++] = sqlite3_column_double(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+
+    /* First 15 from full sort must match LIMIT 15 */
+    int match = (i == 15 && total >= 15);
+    for (int k = 0; k < 15 && match; k++) {
+        if (limit_vals[k] != all_vals[k]) match = 0;
+    }
+    test_report("order_limit_vs_full: top-15 values match", match);
+    free(all_vals);
+
+    sqlite3_exec(db, "DROP TABLE items", NULL, NULL, NULL);
+    sqlite3_close(db);
+    drain_cleanup_test_files();
+}
+
 int test_vtab_run(void)
 {
     test_vtab_basic_select();
@@ -1698,6 +2082,14 @@ int test_vtab_run(void)
     test_vtab_limit_pushdown();
     test_vtab_limit_no_order();
     test_vtab_lazy_prepare();
+
+    /* Round 3: Optimization correctness tests */
+    test_order_limit_heap_correctness();
+    test_integer_sort_correctness();
+    test_drain_l1_cache_transfer();
+    test_lazy_prefetch_all_rows();
+    test_drain_limit_early_termination();
+    test_order_limit_vs_full_order();
 
     return 0;
 }

@@ -31,6 +31,8 @@ static void cursor_free_buffer(clearprism_cursor *cur);
 static void cursor_precreate_alias_values(clearprism_cursor *cur);
 static void cursor_free_alias_values(clearprism_cursor *cur);
 static void cursor_free_drain(clearprism_cursor *cur);
+static void cursor_flush_drain_to_l1(clearprism_cursor *cur);
+static void *prefetch_worker(void *arg);
 
 /* Merge-sort heap helpers */
 static int  merge_compare(clearprism_cursor *cur, int a_idx, int b_idx);
@@ -50,6 +52,21 @@ static void *parallel_prepare_worker(void *arg)
         int idx = __sync_fetch_and_add(&ctx->next_handle, 1);
         if (idx >= ctx->cur->n_handles) break;
         handle_prepare_and_step(ctx->cur, &ctx->cur->handles[idx]);
+    }
+    return NULL;
+}
+
+/* Background prefetch: prepare the next source handle while the current
+ * one is being iterated.  This overlaps I/O (sqlite3_open + prepare) with
+ * row iteration, hiding source-switch latency. */
+static void *prefetch_worker(void *arg)
+{
+    clearprism_cursor *cur = (clearprism_cursor *)arg;
+    int idx = cur->prefetch_next_idx;
+    if (idx >= 0 && idx < cur->n_handles) {
+        clearprism_source_handle *h = &cur->handles[idx];
+        if (!h->stmt && !h->errored)
+            handle_prepare_and_step(cur, h);
     }
     return NULL;
 }
@@ -148,6 +165,12 @@ static int cursor_try_parallel_drain(clearprism_cursor *cur, int idxNum)
 {
     clearprism_vtab *vtab = cur->vtab;
     int n_cols = vtab->nCol + 1;  /* +1 for _source_db */
+
+    /* Multi-source ORDER BY: the live merge-sort heap is far more efficient
+     * than drain.  The heap only processes LIMIT rows via xNext, while drain
+     * would materialize ALL rows from all sources upfront.  For ORDER BY
+     * LIMIT 100 across 20 sources, this avoids materializing 2000 rows. */
+    if (idxNum & CLEARPRISM_PLAN_HAS_MERGE_ORDER) return 0;
 
     /* Check if drain should be attempted based on query plan heuristics */
     int should_drain = 0;
@@ -402,24 +425,39 @@ static int cursor_try_parallel_drain(clearprism_cursor *cur, int idxNum)
     /* No ORDER BY or merge fallback: simple concatenation */
     {
         int out_idx = 0;
-        for (int i = 0; i < cur->n_handles; i++) {
+        /* For LIMIT queries, only concatenate enough rows */
+        int want = total_rows;
+        if (cur->limit_remaining > 0) {
+            int64_t lim = cur->limit_remaining;
+            if (cur->offset_remaining > 0) lim += cur->offset_remaining;
+            if (lim < total_rows) want = (int)lim;
+        }
+        for (int i = 0; i < cur->n_handles && out_idx < want; i++) {
             int cnt = ctx.per_handle_counts[i];
             if (cnt == 0) continue;
+            int to_copy = cnt;
+            if (out_idx + to_copy > want) to_copy = want - out_idx;
             /* Transfer values (move pointers, no dup) */
             memcpy(&merged_values[out_idx * n_cols],
                    ctx.per_handle_values[i],
-                   cnt * n_cols * (int)sizeof(sqlite3_value *));
-            for (int r = 0; r < cnt; r++) {
+                   to_copy * n_cols * (int)sizeof(sqlite3_value *));
+            for (int r = 0; r < to_copy; r++) {
                 merged_rows[out_idx + r].composite_rowid = ctx.per_handle_rowids[i][r];
                 merged_rows[out_idx + r].values = &merged_values[(out_idx + r) * n_cols];
                 merged_rows[out_idx + r].n_values = n_cols;
                 merged_rows[out_idx + r].next = NULL;
             }
-            out_idx += cnt;
-            /* Free per-handle shell only (values moved) */
+            out_idx += to_copy;
+            /* Free excess values beyond what was copied */
+            if (to_copy < cnt) {
+                for (int r = to_copy; r < cnt; r++)
+                    for (int c = 0; c < n_cols; c++)
+                        sqlite3_value_free(ctx.per_handle_values[i][r * n_cols + c]);
+            }
             sqlite3_free(ctx.per_handle_values[i]);
             ctx.per_handle_values[i] = NULL;
         }
+        total_rows = out_idx;  /* Update for subsequent code */
     }
 
 drain_done:
@@ -457,43 +495,12 @@ drain_done:
         }
     }
 
-    /* Also populate L1 cache from drain data if applicable */
-    if (cur->cache_key && vtab->cache && !cur->buffer_overflow &&
-        total_rows <= (int)vtab->l1_max_rows) {
-        /* Duplicate values for L1 (drain owns its copies, L1 needs its own) */
-        clearprism_l1_row *l1_rows = sqlite3_malloc(total_rows * (int)sizeof(clearprism_l1_row));
-        sqlite3_value **l1_values = sqlite3_malloc(total_rows * n_cols * (int)sizeof(sqlite3_value *));
-        if (l1_rows && l1_values) {
-            size_t byte_size = 0;
-            for (int r = 0; r < total_rows; r++) {
-                l1_rows[r].composite_rowid = merged_rows[r].composite_rowid;
-                l1_rows[r].n_values = n_cols;
-                l1_rows[r].values = &l1_values[r * n_cols];
-                l1_rows[r].next = NULL;
-                for (int c = 0; c < n_cols; c++) {
-                    sqlite3_value *src = merged_values[r * n_cols + c];
-                    l1_values[r * n_cols + c] = src ? sqlite3_value_dup(src) : NULL;
-                    if (src) byte_size += clearprism_value_memsize(src);
-                }
-                byte_size += sizeof(clearprism_l1_row) + n_cols * sizeof(sqlite3_value *);
-            }
-            clearprism_cache_store_l1(vtab->cache, cur->cache_key,
-                                       l1_rows, l1_values,
-                                       total_rows, n_cols, byte_size);
-        } else {
-            sqlite3_free(l1_rows);
-            sqlite3_free(l1_values);
-        }
-        /* Free the cache key so cursor_buffer_current_row skips */
-        sqlite3_free(cur->cache_key);
-        cur->cache_key = NULL;
-    }
-
     return 1;  /* Drain succeeded */
 }
 
 static void cursor_free_drain(clearprism_cursor *cur)
 {
+    cursor_flush_drain_to_l1(cur);
     if (cur->drain_values) {
         int total = cur->drain_n_rows * cur->drain_n_cols;
         for (int i = 0; i < total; i++)
@@ -509,8 +516,62 @@ static void cursor_free_drain(clearprism_cursor *cur)
     cur->serving_from_drain = 0;
 }
 
+/* Public wrapper: flush drain to L1 then free — called from xClose */
+void clearprism_cursor_flush_drain(clearprism_cursor *cur)
+{
+    cursor_free_drain(cur);
+}
+
+/*
+ * Transfer drain buffer ownership to L1 cache (zero-copy).
+ * Avoids duplicating values that drain already materialized.
+ */
+static void cursor_flush_drain_to_l1(clearprism_cursor *cur)
+{
+    if (!cur->cache_key || !cur->vtab->cache ||
+        !cur->drain_rows || !cur->drain_values || cur->drain_n_rows == 0)
+        return;
+
+    clearprism_vtab *vtab = cur->vtab;
+    int n = cur->drain_n_rows;
+    int nc = cur->drain_n_cols;
+
+    if (n > (int)vtab->l1_max_rows) return;
+
+    /* Calculate byte size for L1 budget check */
+    size_t byte_size = 0;
+    for (int r = 0; r < n; r++) {
+        for (int c = 0; c < nc; c++) {
+            sqlite3_value *v = cur->drain_values[r * nc + c];
+            if (v) byte_size += clearprism_value_memsize(v);
+        }
+        byte_size += sizeof(clearprism_l1_row) + nc * sizeof(sqlite3_value *);
+    }
+
+    if ((int64_t)byte_size > vtab->l1_max_bytes) return;
+
+    /* Fix up row->values pointers for L1 entry */
+    for (int i = 0; i < n; i++) {
+        cur->drain_rows[i].values = &cur->drain_values[i * nc];
+        cur->drain_rows[i].next = NULL;
+    }
+
+    /* Transfer ownership to L1 cache */
+    clearprism_cache_store_l1(vtab->cache, cur->cache_key,
+                               cur->drain_rows, cur->drain_values,
+                               n, nc, byte_size);
+
+    /* Ownership transferred — NULL out without freeing */
+    cur->drain_rows = NULL;
+    cur->drain_values = NULL;
+    cur->drain_n_rows = 0;
+    cur->drain_n_cols = 0;
+    sqlite3_free(cur->cache_key);
+    cur->cache_key = NULL;
+}
+
 /* Get current source handle, or NULL */
-static clearprism_source_handle *cursor_current_handle(clearprism_cursor *cur)
+static inline clearprism_source_handle *cursor_current_handle(clearprism_cursor *cur)
 {
     if (cur->current_handle_idx >= 0 && cur->current_handle_idx < cur->n_handles)
         return &cur->handles[cur->current_handle_idx];
@@ -518,14 +579,14 @@ static clearprism_source_handle *cursor_current_handle(clearprism_cursor *cur)
 }
 
 /* Convenience: get stmt from current handle */
-static sqlite3_stmt *cursor_current_stmt(clearprism_cursor *cur)
+static inline sqlite3_stmt *cursor_current_stmt(clearprism_cursor *cur)
 {
     clearprism_source_handle *h = cursor_current_handle(cur);
     return h ? h->stmt : NULL;
 }
 
 /* Convenience: get source index from current handle */
-static int cursor_current_source_idx(clearprism_cursor *cur)
+static inline int cursor_current_source_idx(clearprism_cursor *cur)
 {
     clearprism_source_handle *h = cursor_current_handle(cur);
     return h ? h->source_idx : 0;
@@ -1083,8 +1144,15 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     } else {
         /* Lazy mode: prepare only the first source, rest on demand */
         cur->lazy_prepare = 1;
+        cur->prefetch_active = 0;
         if (cur->n_handles > 0)
             handle_prepare_and_step(cur, &cur->handles[0]);
+        /* Start prefetching second source in background */
+        if (cur->n_handles > 1) {
+            cur->prefetch_next_idx = 1;
+            if (pthread_create(&cur->prefetch_thread, NULL, prefetch_worker, cur) == 0)
+                cur->prefetch_active = 1;
+        }
     }
 
     /* Early buffer skip: predict uncacheable queries to avoid wasted
@@ -1214,7 +1282,10 @@ int clearprism_vtab_next(sqlite3_vtab_cursor *pCur)
         cur->limit_remaining--;
         if (cur->limit_remaining == 0) {
             cur->eof = 1;
-            cursor_flush_buffer_to_l1(cur);
+            if (cur->serving_from_drain)
+                cursor_flush_drain_to_l1(cur);
+            else
+                cursor_flush_buffer_to_l1(cur);
             return SQLITE_OK;
         }
     }
@@ -1224,6 +1295,7 @@ int clearprism_vtab_next(sqlite3_vtab_cursor *pCur)
         cur->drain_idx++;
         if (cur->drain_idx >= cur->drain_n_rows) {
             cur->eof = 1;
+            cursor_flush_drain_to_l1(cur);
         }
         return SQLITE_OK;
     }
@@ -1540,6 +1612,12 @@ static int cursor_advance_source(clearprism_cursor *cur)
 {
     clearprism_vtab *vtab = cur->vtab;
 
+    /* Join background prefetch before accessing next handle */
+    if (cur->prefetch_active) {
+        pthread_join(cur->prefetch_thread, NULL);
+        cur->prefetch_active = 0;
+    }
+
     /* Clean up current handle */
     clearprism_source_handle *h = cursor_current_handle(cur);
     if (h) {
@@ -1557,7 +1635,17 @@ static int cursor_advance_source(clearprism_cursor *cur)
         /* In lazy mode, prepare this handle on demand */
         if (cur->lazy_prepare && !h->stmt && !h->errored)
             handle_prepare_and_step(cur, h);
-        if (h->has_row && !h->errored) return SQLITE_OK;
+        if (h->has_row && !h->errored) {
+            /* Start prefetching the handle after this one */
+            int next = cur->current_handle_idx + 1;
+            if (cur->lazy_prepare && next < cur->n_handles &&
+                !cur->handles[next].stmt && !cur->handles[next].errored) {
+                cur->prefetch_next_idx = next;
+                if (pthread_create(&cur->prefetch_thread, NULL, prefetch_worker, cur) == 0)
+                    cur->prefetch_active = 1;
+            }
+            return SQLITE_OK;
+        }
         /* Clean up empty/errored handle */
         if (h->stmt) { sqlite3_finalize(h->stmt); h->stmt = NULL; }
         if (h->conn) {
@@ -1577,6 +1665,11 @@ static int cursor_advance_source(clearprism_cursor *cur)
 static void cursor_cleanup_handles(clearprism_cursor *cur)
 {
     if (!cur->handles) return;
+    /* Join any active prefetch thread */
+    if (cur->prefetch_active) {
+        pthread_join(cur->prefetch_thread, NULL);
+        cur->prefetch_active = 0;
+    }
     clearprism_vtab *vtab = cur->vtab;
     for (int i = 0; i < cur->n_handles; i++) {
         clearprism_source_handle *h = &cur->handles[i];
