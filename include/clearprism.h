@@ -50,6 +50,20 @@
 #define CLEARPRISM_MAX_PREPARE_THREADS 16
 #define CLEARPRISM_MIN_PARALLEL_SOURCES 4
 
+/* Persistent worker thread pool */
+typedef struct clearprism_work_pool clearprism_work_pool;
+struct clearprism_work_pool {
+    pthread_t  *threads;
+    int         n_threads;
+    void      *(*work_fn)(void *);
+    void       *work_arg;
+    pthread_mutex_t mtx;
+    pthread_cond_t  start_cond;
+    pthread_cond_t  done_cond;
+    int         pending;
+    int         generation;
+    int         shutdown;
+};
 
 /* Forward declarations */
 typedef struct clearprism_vtab       clearprism_vtab;
@@ -269,6 +283,9 @@ struct clearprism_vtab {
     int      l2_refresh_interval_sec;
 
     pthread_mutex_t lock;
+
+    /* Persistent worker thread pool (created at vtab init) */
+    clearprism_work_pool *work_pool;
 };
 
 /* ---------- Cursor ---------- */
@@ -337,6 +354,9 @@ struct clearprism_cursor {
     /* Merge-sort heap (array of handle indices, min-heap by ORDER BY columns) */
     int     *heap;
     int      heap_size;
+
+    /* Cached ORDER BY column types for fast merge-sort comparison */
+    int     *order_col_types;
 
     /* Parallel drain — materialized flat buffer (Optimization 1) */
     clearprism_l1_row *drain_rows;
@@ -466,6 +486,12 @@ int  clearprism_cache_cursor_next(clearprism_cache_cursor *cc);
 int  clearprism_cache_cursor_eof(clearprism_cache_cursor *cc);
 sqlite3_value *clearprism_cache_cursor_value(clearprism_cache_cursor *cc,
                                               int iCol);
+
+/* clearprism_query.c — Worker thread pool */
+clearprism_work_pool *clearprism_work_pool_create(int n_threads);
+void clearprism_work_pool_destroy(clearprism_work_pool *pool);
+void clearprism_work_pool_run(clearprism_work_pool *pool,
+                               void *(*fn)(void *), void *arg);
 
 /* clearprism_agg.c — Aggregate pushdown functions */
 int clearprism_register_agg_functions(sqlite3 *db);

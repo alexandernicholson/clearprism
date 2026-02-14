@@ -39,6 +39,93 @@ static int  merge_compare(clearprism_cursor *cur, int a_idx, int b_idx);
 static void heap_sift_down(clearprism_cursor *cur, int i);
 static void heap_build(clearprism_cursor *cur);
 
+/* ========== Persistent worker thread pool ========== */
+
+static void *work_pool_thread(void *arg)
+{
+    clearprism_work_pool *pool = (clearprism_work_pool *)arg;
+    int my_gen = 0;
+    pthread_mutex_lock(&pool->mtx);
+    while (1) {
+        while (pool->generation == my_gen && !pool->shutdown)
+            pthread_cond_wait(&pool->start_cond, &pool->mtx);
+        if (pool->shutdown) {
+            pthread_mutex_unlock(&pool->mtx);
+            return NULL;
+        }
+        my_gen = pool->generation;
+        void *(*fn)(void *) = pool->work_fn;
+        void *a = pool->work_arg;
+        pthread_mutex_unlock(&pool->mtx);
+
+        fn(a);
+
+        pthread_mutex_lock(&pool->mtx);
+        if (--pool->pending == 0)
+            pthread_cond_signal(&pool->done_cond);
+    }
+}
+
+clearprism_work_pool *clearprism_work_pool_create(int n_threads)
+{
+    if (n_threads < 1) n_threads = 1;
+    clearprism_work_pool *pool = sqlite3_malloc(sizeof(*pool));
+    if (!pool) return NULL;
+    memset(pool, 0, sizeof(*pool));
+
+    pool->n_threads = n_threads;
+    pool->threads = sqlite3_malloc(n_threads * (int)sizeof(pthread_t));
+    if (!pool->threads) { sqlite3_free(pool); return NULL; }
+
+    pthread_mutex_init(&pool->mtx, NULL);
+    pthread_cond_init(&pool->start_cond, NULL);
+    pthread_cond_init(&pool->done_cond, NULL);
+
+    /* Use 256KB stacks instead of the default 8MB to reduce virtual memory
+     * footprint.  Workers only call SQLite prepare/step (which use <20KB
+     * of stack) and lightweight work-stealing loops. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    for (int i = 0; i < n_threads; i++)
+        pthread_create(&pool->threads[i], &attr, work_pool_thread, pool);
+    pthread_attr_destroy(&attr);
+
+    return pool;
+}
+
+void clearprism_work_pool_destroy(clearprism_work_pool *pool)
+{
+    if (!pool) return;
+    pthread_mutex_lock(&pool->mtx);
+    pool->shutdown = 1;
+    pthread_cond_broadcast(&pool->start_cond);
+    pthread_mutex_unlock(&pool->mtx);
+
+    for (int i = 0; i < pool->n_threads; i++)
+        pthread_join(pool->threads[i], NULL);
+
+    pthread_mutex_destroy(&pool->mtx);
+    pthread_cond_destroy(&pool->start_cond);
+    pthread_cond_destroy(&pool->done_cond);
+    sqlite3_free(pool->threads);
+    sqlite3_free(pool);
+}
+
+void clearprism_work_pool_run(clearprism_work_pool *pool,
+                               void *(*fn)(void *), void *arg)
+{
+    pthread_mutex_lock(&pool->mtx);
+    pool->work_fn = fn;
+    pool->work_arg = arg;
+    pool->pending = pool->n_threads;
+    pool->generation++;
+    pthread_cond_broadcast(&pool->start_cond);
+    while (pool->pending > 0)
+        pthread_cond_wait(&pool->done_cond, &pool->mtx);
+    pthread_mutex_unlock(&pool->mtx);
+}
+
 /* Parallel prepare infrastructure */
 struct parallel_prepare_ctx {
     clearprism_cursor *cur;
@@ -228,17 +315,10 @@ static int cursor_try_parallel_drain(clearprism_cursor *cur, int idxNum)
 
     if (n_threads == 1) {
         drain_worker(&ctx);
+    } else if (vtab->work_pool) {
+        clearprism_work_pool_run(vtab->work_pool, drain_worker, &ctx);
     } else {
-        pthread_t *threads = sqlite3_malloc(n_threads * (int)sizeof(pthread_t));
-        if (threads) {
-            for (int i = 0; i < n_threads; i++)
-                pthread_create(&threads[i], NULL, drain_worker, &ctx);
-            for (int i = 0; i < n_threads; i++)
-                pthread_join(threads[i], NULL);
-            sqlite3_free(threads);
-        } else {
-            drain_worker(&ctx);
-        }
+        drain_worker(&ctx);
     }
 
     /* Compute total row count */
@@ -736,10 +816,12 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     cur->eof = 0;
     cur->serving_from_cache = 0;
 
-    /* Free merge-sort heap */
+    /* Free merge-sort heap and cached column types */
     sqlite3_free(cur->heap);
     cur->heap = NULL;
     cur->heap_size = 0;
+    sqlite3_free(cur->order_col_types);
+    cur->order_col_types = NULL;
 
     /* Free saved argv */
     if (cur->saved_argv) {
@@ -1128,18 +1210,13 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
         if (n_threads == 1) {
             for (int i = 0; i < cur->n_handles; i++)
                 handle_prepare_and_step(cur, &cur->handles[i]);
+        } else if (vtab->work_pool) {
+            clearprism_work_pool_run(vtab->work_pool,
+                                      parallel_prepare_worker, &ctx);
         } else {
-            pthread_t *threads = sqlite3_malloc(n_threads * (int)sizeof(pthread_t));
-            if (!threads) {
-                for (int i = 0; i < cur->n_handles; i++)
-                    handle_prepare_and_step(cur, &cur->handles[i]);
-            } else {
-                for (int i = 0; i < n_threads; i++)
-                    pthread_create(&threads[i], NULL, parallel_prepare_worker, &ctx);
-                for (int i = 0; i < n_threads; i++)
-                    pthread_join(threads[i], NULL);
-                sqlite3_free(threads);
-            }
+            /* Fallback: no pool available */
+            for (int i = 0; i < cur->n_handles; i++)
+                handle_prepare_and_step(cur, &cur->handles[i]);
         }
     } else {
         /* Lazy mode: prepare only the first source, rest on demand */
@@ -1198,6 +1275,20 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                     cur->heap[cur->heap_size++] = i;
             }
             if (cur->heap_size > 0) {
+                /* Cache column types from first heap entry for fast comparison */
+                if (cur->plan.n_order_cols > 0) {
+                    cur->order_col_types = sqlite3_malloc(
+                        cur->plan.n_order_cols * (int)sizeof(int));
+                    if (cur->order_col_types) {
+                        int top = cur->heap[0];
+                        for (int i = 0; i < cur->plan.n_order_cols; i++) {
+                            int col = cur->plan.order_cols[i].col_idx +
+                                      CLEARPRISM_COL_OFFSET;
+                            cur->order_col_types[i] =
+                                sqlite3_column_type(cur->handles[top].stmt, col);
+                        }
+                    }
+                }
                 heap_build(cur);
                 cur->current_handle_idx = cur->heap[0];
                 cursor_buffer_current_row(cur);
@@ -1449,22 +1540,26 @@ int clearprism_vtab_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx,
         return SQLITE_OK;
     }
 
-    /* Hidden _source_db column */
+    /* Hidden _source_db column — alias persists for cursor lifetime */
     if (iCol == vtab->nCol) {
         int si = cursor_current_source_idx(cur);
         const char *alias = (si < cur->n_sources) ? cur->sources[si].alias : NULL;
         if (alias)
-            sqlite3_result_text(ctx, alias, -1, SQLITE_TRANSIENT);
+            sqlite3_result_text(ctx, alias, -1, SQLITE_STATIC);
         else
             sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
 
-    /* Real columns — offset by CLEARPRISM_COL_OFFSET because rowid is column 0 */
+    /* Real columns — use sqlite3_result_value for minimal overhead.
+     * SQLite internally reuses Mem buffers in the output register, so
+     * steady-state text/blob copies go into pre-allocated buffers (no
+     * malloc).  This is faster than type-dispatched SQLITE_STATIC because
+     * it avoids per-column sqlite3_column_type + switch overhead. */
     sqlite3_stmt *stmt = cursor_current_stmt(cur);
     if (stmt && iCol >= 0 && iCol < vtab->nCol) {
-        sqlite3_result_value(ctx, sqlite3_column_value(stmt,
-                             iCol + CLEARPRISM_COL_OFFSET));
+        sqlite3_result_value(ctx,
+            sqlite3_column_value(stmt, iCol + CLEARPRISM_COL_OFFSET));
     } else {
         sqlite3_result_null(ctx);
     }
@@ -1892,16 +1987,51 @@ static void cursor_free_buffer(clearprism_cursor *cur)
 
 /* ========== Merge-sort heap ========== */
 
+/*
+ * Typed merge comparison: uses cached column types to skip sqlite3_value_type
+ * dispatch and function call overhead. Direct sqlite3_column_int64/double/text
+ * are faster than sqlite3_column_value + clearprism_value_compare.
+ */
 static int merge_compare(clearprism_cursor *cur, int a_idx, int b_idx)
 {
-    clearprism_source_handle *a = &cur->handles[a_idx];
-    clearprism_source_handle *b = &cur->handles[b_idx];
+    sqlite3_stmt *sa = cur->handles[a_idx].stmt;
+    sqlite3_stmt *sb = cur->handles[b_idx].stmt;
+    int *types = cur->order_col_types;
 
     for (int i = 0; i < cur->plan.n_order_cols; i++) {
         int col = cur->plan.order_cols[i].col_idx + CLEARPRISM_COL_OFFSET;
-        sqlite3_value *va = sqlite3_column_value(a->stmt, col);
-        sqlite3_value *vb = sqlite3_column_value(b->stmt, col);
-        int cmp = clearprism_value_compare(va, vb);
+        int cmp;
+
+        int t = types ? types[i] : 0;
+        switch (t) {
+        case SQLITE_INTEGER: {
+            int64_t ia = sqlite3_column_int64(sa, col);
+            int64_t ib = sqlite3_column_int64(sb, col);
+            cmp = (ia > ib) - (ia < ib);
+            break;
+        }
+        case SQLITE_FLOAT: {
+            double da = sqlite3_column_double(sa, col);
+            double db = sqlite3_column_double(sb, col);
+            cmp = (da > db) - (da < db);
+            break;
+        }
+        case SQLITE_TEXT: {
+            const unsigned char *ta = sqlite3_column_text(sa, col);
+            const unsigned char *tb = sqlite3_column_text(sb, col);
+            if (ta && tb) cmp = strcmp((const char *)ta, (const char *)tb);
+            else cmp = (ta != NULL) - (tb != NULL);
+            break;
+        }
+        default: {
+            /* Fallback: mixed types or BLOB — use generic compare */
+            sqlite3_value *va = sqlite3_column_value(sa, col);
+            sqlite3_value *vb = sqlite3_column_value(sb, col);
+            cmp = clearprism_value_compare(va, vb);
+            break;
+        }
+        }
+
         if (cur->plan.order_cols[i].desc) cmp = -cmp;
         if (cmp != 0) return cmp;
     }

@@ -86,6 +86,8 @@ static int vtab_parse_args(int argc, const char *const *argv,
     vtab->pool_max_open = CLEARPRISM_DEFAULT_POOL_MAX_OPEN;
     vtab->l2_refresh_interval_sec = CLEARPRISM_DEFAULT_L2_REFRESH_SEC;
 
+    int user_set_max_bytes = 0;
+
     for (int i = 3; i < argc; i++) {
         char *key = NULL, *value = NULL;
         if (!parse_kv(argv[i], &key, &value)) {
@@ -105,6 +107,7 @@ static int vtab_parse_args(int argc, const char *const *argv,
             vtab->l1_max_rows = atoll(value);
         } else if (strcmp(key, "l1_max_bytes") == 0) {
             vtab->l1_max_bytes = atoll(value);
+            user_set_max_bytes = 1;
         } else if (strcmp(key, "pool_max_open") == 0) {
             vtab->pool_max_open = atoi(value);
         } else if (strcmp(key, "l2_refresh_sec") == 0) {
@@ -123,6 +126,15 @@ static int vtab_parse_args(int argc, const char *const *argv,
     if (!vtab->target_table) {
         *pzErr = clearprism_strdup("clearprism: 'table' argument is required");
         return SQLITE_ERROR;
+    }
+
+    /* Auto-scale L1 byte budget when l1_max_rows is set large but
+     * l1_max_bytes was not explicitly configured.  Each cached row costs
+     * ~512 bytes (struct overhead + sqlite3_value objects + payload). */
+    if (!user_set_max_bytes && vtab->l1_max_rows > CLEARPRISM_DEFAULT_L1_MAX_ROWS) {
+        int64_t auto_bytes = vtab->l1_max_rows * 512;
+        if (auto_bytes > vtab->l1_max_bytes)
+            vtab->l1_max_bytes = auto_bytes;
     }
 
     return SQLITE_OK;
@@ -317,6 +329,10 @@ static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr)
     }
 
     vtab->cache = clearprism_cache_create(l1, l2);
+
+    /* Create persistent worker thread pool */
+    vtab->work_pool = clearprism_work_pool_create(CLEARPRISM_MAX_PREPARE_THREADS);
+
     return SQLITE_OK;
 }
 
@@ -401,6 +417,7 @@ static void vtab_free(clearprism_vtab *vtab)
     if (vtab->target_table)
         clearprism_unregister_vtab(vtab->target_table);
 
+    if (vtab->work_pool) clearprism_work_pool_destroy(vtab->work_pool);
     if (vtab->cache) clearprism_cache_destroy(vtab->cache);
     if (vtab->pool) clearprism_connpool_destroy(vtab->pool);
     if (vtab->registry) clearprism_registry_close(vtab->registry);
@@ -467,8 +484,9 @@ int clearprism_vtab_close(sqlite3_vtab_cursor *pCur)
         sqlite3_free(cur->handles);
     }
 
-    /* Free merge-sort heap */
+    /* Free merge-sort heap and cached column types */
     sqlite3_free(cur->heap);
+    sqlite3_free(cur->order_col_types);
 
     /* Free query plan */
     clearprism_query_plan_clear(&cur->plan);
