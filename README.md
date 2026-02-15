@@ -1,6 +1,6 @@
 # Clearprism
 
-A SQLite extension that federates read-only queries across multiple SQLite databases sharing the same schema. Query 100+ databases as if they were a single table — via a virtual table for SQL convenience, or a streaming C API for maximum throughput.
+A SQLite extension that federates read-only queries across multiple SQLite databases sharing the same schema. Query 100+ databases as if they were a single table.
 
 ```mermaid
 graph LR
@@ -30,7 +30,7 @@ graph LR
 -- Load the extension
 .load ./clearprism
 
--- Create a federated view of the "users" table across all source databases
+-- Create a federated view across all source databases
 CREATE VIRTUAL TABLE all_users USING clearprism(
     registry_db='/path/to/registry.db',
     table='users'
@@ -43,22 +43,18 @@ SELECT name, email, _source_db FROM all_users WHERE email LIKE '%@example.com';
 SELECT * FROM all_users WHERE _source_db = 'west_region';
 ```
 
-For high-throughput bulk scans, use the streaming Scanner API to bypass the virtual table protocol entirely:
+For best performance, use **snapshot mode** to materialize all source data locally at creation time. Repeated queries then read from the snapshot with no per-query source I/O:
 
-```c
-clearprism_scanner *sc = clearprism_scan_open("registry.db", "users");
+```sql
+CREATE VIRTUAL TABLE all_users USING clearprism(
+    registry_db='/path/to/registry.db',
+    table='users',
+    mode='snapshot'
+);
 
-// Optional: push a WHERE filter
-clearprism_scan_filter(sc, "email LIKE ?");
-clearprism_scan_bind_text(sc, 1, "%@example.com");
-
-while (clearprism_scan_next(sc)) {
-    const char *name  = clearprism_scan_text(sc, 1);   // zero-copy
-    const char *email = clearprism_scan_text(sc, 2);
-    printf("%s: %s (from %s)\n", name, email, clearprism_scan_source_alias(sc));
-}
-
-clearprism_scan_close(sc);
+-- Fast: reads from local shadow table, not source databases
+SELECT COUNT(*) FROM all_users;
+SELECT * FROM all_users WHERE email LIKE '%@example.com';
 ```
 
 ## Features
@@ -77,7 +73,6 @@ clearprism_scan_close(sc);
 - **Resilient** — skips unavailable sources instead of failing the entire query
 - **Thread-safe** with per-component locking and a strict lock hierarchy
 - **Snapshot mode** materializes all source data into a local shadow table for fast repeated queries
-- **Streaming Scanner API** for zero-vtab-overhead bulk iteration (~1.09x direct SQLite speed)
 
 ## Quick Start
 
@@ -212,6 +207,27 @@ clearprism/
 ├── CMakeLists.txt
 └── Makefile
 ```
+
+## Streaming Scanner API
+
+For C applications that need maximum throughput over very large datasets (100M+ rows), the Scanner API bypasses the virtual table protocol entirely for ~1.09x direct SQLite speed:
+
+```c
+clearprism_scanner *sc = clearprism_scan_open("registry.db", "users");
+
+clearprism_scan_filter(sc, "email LIKE ?");
+clearprism_scan_bind_text(sc, 1, "%@example.com");
+
+while (clearprism_scan_next(sc)) {
+    const char *name  = clearprism_scan_text(sc, 1);   // zero-copy
+    const char *email = clearprism_scan_text(sc, 2);
+    printf("%s: %s (from %s)\n", name, email, clearprism_scan_source_alias(sc));
+}
+
+clearprism_scan_close(sc);
+```
+
+See the [API Reference](docs/api.md) for full scanner documentation.
 
 ## License
 
