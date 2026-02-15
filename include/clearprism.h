@@ -300,6 +300,7 @@ struct clearprism_vtab {
     /* UX: creation warnings, L2 status, schema override */
     char *init_warnings;      /* warnings collected during vtab creation */
     int   l2_active;          /* 1 if L2 cache initialized successfully */
+    int   l2_disabled;        /* 1 if user explicitly set cache_db='none' */
     char *schema_override;    /* user-supplied schema string (if any) */
 };
 

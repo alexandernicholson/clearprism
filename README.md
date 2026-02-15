@@ -167,7 +167,7 @@ All parameters are passed as `key=value` pairs in the `CREATE VIRTUAL TABLE` sta
 | `registry_db` | Yes | — | Path to the registry database |
 | `table` | Yes | — | Name of the table to federate |
 | `mode` | No | `live` | `live` (query on demand) or `snapshot` (materialize at creation) |
-| `cache_db` | No | — | Path for L2 disk cache (enables shadow tables) |
+| `cache_db` | No | auto (`/tmp/...`) | Path for L2 disk cache; auto-generated if omitted, `'none'` to disable |
 | `l1_max_rows` | No | `10000` | Maximum rows in L1 memory cache |
 | `l1_max_bytes` | No | `67108864` | Maximum bytes in L1 cache (64 MiB) |
 | `pool_max_open` | No | `32` | Maximum simultaneously open database connections |

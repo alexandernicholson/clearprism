@@ -22,6 +22,13 @@ static void admin_cleanup(void)
     unlink(ADMIN_SRC1_PATH);
     unlink(ADMIN_SRC2_PATH);
     unlink("/tmp/clearprism_admin_test_initreg.db");
+    /* Clean up auto-generated L2 cache files */
+    unlink("/tmp/clearprism_cache_test_items_items.db");
+    unlink("/tmp/clearprism_cache_test_items_items.db-wal");
+    unlink("/tmp/clearprism_cache_test_items_items.db-shm");
+    unlink("/tmp/clearprism_cache_good1_items.db");
+    unlink("/tmp/clearprism_cache_good1_items.db-wal");
+    unlink("/tmp/clearprism_cache_good1_items.db-shm");
 }
 
 static void admin_setup(void)
@@ -513,6 +520,81 @@ static void test_admin_cache_hit_miss(void)
     admin_cleanup();
 }
 
+/* ========== L2 auto-enable tests ========== */
+
+static void test_admin_l2_auto_enable(void)
+{
+    admin_setup();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    /* Create vtab WITHOUT cache_db — L2 should auto-enable */
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE test_items USING clearprism("
+        "  registry_db='%s', table='items')", ADMIN_REG_PATH);
+    char *err = NULL;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
+    sqlite3_free(sql);
+    test_report("l2_auto: vtab created", rc == SQLITE_OK);
+    if (err) { printf("    error: %s\n", err); sqlite3_free(err); err = NULL; }
+
+    /* Status should show l2_active:1 */
+    if (rc == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        sqlite3_prepare_v2(db, "SELECT clearprism_status('items')", -1, &stmt, NULL);
+        sqlite3_step(stmt);
+        const char *json = (const char *)sqlite3_column_text(stmt, 0);
+        test_report("l2_auto: l2_active is 1", json && strstr(json, "\"l2_active\":1") != NULL);
+        sqlite3_finalize(stmt);
+
+        sqlite3_exec(db, "DROP TABLE test_items", NULL, NULL, NULL);
+    }
+
+    /* Clean up auto-generated cache file */
+    unlink("/tmp/clearprism_cache_test_items_items.db");
+    unlink("/tmp/clearprism_cache_test_items_items.db-wal");
+    unlink("/tmp/clearprism_cache_test_items_items.db-shm");
+
+    sqlite3_close(db);
+    admin_cleanup();
+}
+
+static void test_admin_l2_disable(void)
+{
+    admin_setup();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    /* Create vtab with cache_db='none' — L2 should be disabled */
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE test_items USING clearprism("
+        "  registry_db='%s', table='items', cache_db='none')", ADMIN_REG_PATH);
+    char *err = NULL;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
+    sqlite3_free(sql);
+    test_report("l2_disable: vtab created", rc == SQLITE_OK);
+    if (err) { printf("    error: %s\n", err); sqlite3_free(err); err = NULL; }
+
+    /* Status should show l2_active:0 */
+    if (rc == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        sqlite3_prepare_v2(db, "SELECT clearprism_status('items')", -1, &stmt, NULL);
+        sqlite3_step(stmt);
+        const char *json = (const char *)sqlite3_column_text(stmt, 0);
+        test_report("l2_disable: l2_active is 0", json && strstr(json, "\"l2_active\":0") != NULL);
+        sqlite3_finalize(stmt);
+
+        sqlite3_exec(db, "DROP TABLE test_items", NULL, NULL, NULL);
+    }
+
+    sqlite3_close(db);
+    admin_cleanup();
+}
+
 /* ========== Runner ========== */
 
 int test_admin_run(void)
@@ -526,5 +608,7 @@ int test_admin_run(void)
     test_admin_source_errors_column();
     test_admin_schema_override();
     test_admin_cache_hit_miss();
+    test_admin_l2_auto_enable();
+    test_admin_l2_disable();
     return 0;
 }

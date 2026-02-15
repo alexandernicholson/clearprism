@@ -189,8 +189,12 @@ static int vtab_parse_args(int argc, const char *const *argv,
             vtab->target_table = value;
             value = NULL;
         } else if (strcmp(key, "cache_db") == 0) {
-            vtab->cache_db_path = value;
-            value = NULL;
+            if (strcmp(value, "none") == 0) {
+                vtab->l2_disabled = 1;
+            } else {
+                vtab->cache_db_path = value;
+                value = NULL;
+            }
         } else if (strcmp(key, "schema") == 0) {
             vtab->schema_override = value;
             value = NULL;
@@ -239,6 +243,12 @@ static int vtab_parse_args(int argc, const char *const *argv,
     if (!vtab->target_table) {
         *pzErr = clearprism_strdup("clearprism: 'table' argument is required");
         return SQLITE_ERROR;
+    }
+
+    /* Auto-generate L2 cache path if not specified and not disabled */
+    if (!vtab->cache_db_path && !vtab->l2_disabled) {
+        vtab->cache_db_path = clearprism_mprintf(
+            "/tmp/clearprism_cache_%s_%s.db", argv[2], vtab->target_table);
     }
 
     /* Auto-scale L1 byte budget when l1_max_rows is set large but
