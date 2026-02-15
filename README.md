@@ -16,7 +16,8 @@ graph LR
     subgraph WITH["With Clearprism"]
         direction TB
         A2["Your Code"] -->|"one query"| CP["Clearprism"]
-        CP -->|"auto"| S1["customers_east.db"]
+        CP -->|"cache hit"| CACHE["L1 Cache<br>(in-memory)"]
+        CP -->|"cache miss"| S1["customers_east.db"]
         CP -->|"auto"| S2["customers_west.db"]
         CP -->|"auto"| S3["customers_north.db"]
         CP -->|"auto"| S4["customers_south.db"]
@@ -24,6 +25,7 @@ graph LR
 
     style WITHOUT fill:#2d2d2d,stroke:#666,color:#ccc
     style WITH fill:#1a3a1a,stroke:#4a4,color:#ccc
+    style CACHE fill:#1a1a3a,stroke:#44a,color:#ccc
 ```
 
 ```sql
