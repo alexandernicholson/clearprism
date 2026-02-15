@@ -43,7 +43,7 @@ SELECT name, email, _source_db FROM all_users WHERE email LIKE '%@example.com';
 SELECT * FROM all_users WHERE _source_db = 'west_region';
 ```
 
-For best performance, use **snapshot mode** to materialize all source data locally at creation time. Repeated queries then read from the snapshot with no per-query source I/O:
+For best performance, use **snapshot mode** to materialize all source data locally at creation time. Repeated queries read from the snapshot with no per-query source I/O, and the same L1 cache applies — the first query populates the cache, subsequent identical queries serve from memory:
 
 ```sql
 CREATE VIRTUAL TABLE all_users USING clearprism(
