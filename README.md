@@ -1,6 +1,6 @@
 # Clearprism
 
-A SQLite virtual table extension that federates read-only queries across multiple SQLite databases sharing the same schema. Query 100+ databases as if they were a single table.
+A SQLite extension that federates read-only queries across multiple SQLite databases sharing the same schema. Query 100+ databases as if they were a single table — via a virtual table for SQL convenience, or a streaming C API for maximum throughput.
 
 ```sql
 -- Load the extension
@@ -19,6 +19,24 @@ SELECT name, email, _source_db FROM all_users WHERE email LIKE '%@example.com';
 SELECT * FROM all_users WHERE _source_db = 'west_region';
 ```
 
+For high-throughput bulk scans, use the streaming Scanner API to bypass the virtual table protocol entirely:
+
+```c
+clearprism_scanner *sc = clearprism_scan_open("registry.db", "users");
+
+// Optional: push a WHERE filter
+clearprism_scan_filter(sc, "email LIKE ?");
+clearprism_scan_bind_text(sc, 1, "%@example.com");
+
+while (clearprism_scan_next(sc)) {
+    const char *name  = clearprism_scan_text(sc, 1);   // zero-copy
+    const char *email = clearprism_scan_text(sc, 2);
+    printf("%s: %s (from %s)\n", name, email, clearprism_scan_source_alias(sc));
+}
+
+clearprism_scan_close(sc);
+```
+
 ## Features
 
 - **Federated queries** across 100+ SQLite databases with identical schemas
@@ -34,6 +52,7 @@ SELECT * FROM all_users WHERE _source_db = 'west_region';
 - **Registry auto-reload** detects source list changes without restarting
 - **Resilient** — skips unavailable sources instead of failing the entire query
 - **Thread-safe** with per-component locking and a strict lock hierarchy
+- **Streaming Scanner API** for zero-vtab-overhead bulk iteration (~1.09x direct SQLite speed)
 
 ## Quick Start
 
@@ -154,13 +173,16 @@ clearprism/
 │   ├── clearprism_cache_l1.c   # In-memory LRU cache
 │   ├── clearprism_cache_l2.c   # Shadow table cache with background refresh
 │   ├── clearprism_where.c      # WHERE constraint encoding and SQL generation
-│   └── clearprism_util.c       # Helpers (FNV-1a hash, string utils, error formatting)
+│   ├── clearprism_util.c       # Helpers (FNV-1a hash, string utils, error formatting)
+│   └── clearprism_scanner.c    # Streaming scanner API (zero-vtab-overhead iteration)
 ├── test/
 │   ├── test_main.c             # Test runner
 │   ├── test_registry.c         # Registry unit tests
 │   ├── test_connpool.c         # Connection pool unit tests
 │   ├── test_cache.c            # L1 and unified cache tests
-│   └── test_vtab.c             # End-to-end virtual table tests
+│   ├── test_vtab.c             # End-to-end virtual table tests
+│   ├── test_agg.c              # Aggregate pushdown tests
+│   └── test_scanner.c          # Scanner API tests
 ├── CMakeLists.txt
 └── Makefile
 ```

@@ -40,6 +40,7 @@ This produces `clearprism.so` on Linux or `clearprism.dylib` on macOS.
 |--------|-------------|
 | `make` / `make all` | Build the shared library |
 | `make test` | Build and run the test suite |
+| `make bench` | Build and run the benchmark suite |
 | `make clean` | Remove all build artifacts |
 
 ### Customizing the compiler
@@ -107,6 +108,7 @@ Built with `-DCLEARPRISM_TESTING=1 -DSQLITE_CORE=1`. Compiles all source files w
 |------|-------------|
 | `clearprism.so` / `clearprism.dylib` | Loadable extension shared library |
 | `clearprism_tests` | Test executable |
+| `clearprism_bench` | Benchmark executable |
 | `src/*.o` | Object files (Make build) |
 | `src/*-test.o` | Test-mode object files (Make build) |
 

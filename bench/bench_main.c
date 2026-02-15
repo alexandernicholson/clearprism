@@ -1208,6 +1208,24 @@ static void bench_scenario_federation(void)
             sqlite3_exec(db, "DROP TABLE fed_items", NULL, NULL, NULL);
             sqlite3_close(db);
         }
+
+        /* Clearprism Scanner (zero-vtab-overhead) */
+        {
+            clearprism_scanner *sc = clearprism_scan_open(reg_path, "items");
+            double t0 = bench_now_us();
+            int64_t rows = 0;
+            int ncol = clearprism_scan_column_count(sc);
+            while (clearprism_scan_next(sc)) {
+                /* Touch every column to match direct_sequential workload */
+                for (int c = 0; c < ncol; c++)
+                    clearprism_scan_type(sc, c);
+                rows++;
+            }
+            double wall = bench_now_us() - t0;
+            clearprism_scan_close(sc);
+            fed_row("clearprism_scanner", wall, rows,
+                    "federation_full", "clearprism_scanner");
+        }
     }
 
     /* ---- Filtered: category (indexed, ~1% selectivity) ---- */

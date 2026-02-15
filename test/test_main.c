@@ -14,6 +14,7 @@ extern int test_connpool_run(void);
 extern int test_cache_run(void);
 extern int test_vtab_run(void);
 extern int test_agg_run(void);
+extern int test_scanner_run(void);
 
 /* Simple test framework */
 static int total_tests = 0;
@@ -57,6 +58,10 @@ int main(int argc, char **argv)
 
     printf("[Aggregate Pushdown Tests]\n");
     test_agg_run();
+    printf("\n");
+
+    printf("[Scanner API Tests]\n");
+    test_scanner_run();
     printf("\n");
 
     printf("=== Results: %d/%d passed", passed_tests, total_tests);

@@ -2040,6 +2040,343 @@ static void test_order_limit_vs_full_order(void)
     drain_cleanup_test_files();
 }
 
+/* ========== Snapshot mode tests ========== */
+
+static void test_vtab_snapshot_basic(void)
+{
+    setup_test_environment();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE users USING clearprism("
+        "  registry_db='%s', table='users', mode='snapshot')", REG_PATH);
+    int rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+    test_report("snapshot_basic: create vtab", rc == SQLITE_OK);
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT id, name, email FROM users ORDER BY id", -1, &stmt, NULL);
+    test_report("snapshot_basic: prepare", rc == SQLITE_OK);
+
+    int row_count = 0;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) row_count++;
+        sqlite3_finalize(stmt);
+    }
+    /* 3 sources: east(2) + west(3) + north(1) = 6 rows */
+    test_report("snapshot_basic: returns 6 rows", row_count == 6);
+
+    sqlite3_exec(db, "DROP TABLE users", NULL, NULL, NULL);
+    sqlite3_close(db);
+    cleanup_test_files();
+}
+
+static void test_vtab_snapshot_where(void)
+{
+    setup_test_environment();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE users USING clearprism("
+        "  registry_db='%s', table='users', mode='snapshot')", REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* EQ pushdown */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM users WHERE name = 'Alice'", -1, &stmt, NULL);
+    test_report("snapshot_where: EQ prepare", rc == SQLITE_OK);
+
+    int count = 0;
+    int correct = 1;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(stmt, 0);
+            if (!name || strcmp(name, "Alice") != 0) correct = 0;
+            count++;
+        }
+        sqlite3_finalize(stmt);
+    }
+    test_report("snapshot_where: EQ returns 1 row", count == 1);
+    test_report("snapshot_where: EQ correct value", correct);
+
+    /* LIKE pushdown */
+    rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM users WHERE email LIKE '%example.com'", -1, &stmt, NULL);
+    test_report("snapshot_where: LIKE prepare", rc == SQLITE_OK);
+
+    count = 0;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) count++;
+        sqlite3_finalize(stmt);
+    }
+    test_report("snapshot_where: LIKE returns correct rows", count == 3);
+
+    sqlite3_exec(db, "DROP TABLE users", NULL, NULL, NULL);
+    sqlite3_close(db);
+    cleanup_test_files();
+}
+
+static void test_vtab_snapshot_source_db(void)
+{
+    setup_test_environment();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE users USING clearprism("
+        "  registry_db='%s', table='users', mode='snapshot')", REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT name, _source_db FROM users WHERE _source_db = 'west'",
+        -1, &stmt, NULL);
+    test_report("snapshot_source_db: prepare", rc == SQLITE_OK);
+
+    int count = 0;
+    int all_west = 1;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *src = (const char *)sqlite3_column_text(stmt, 1);
+            if (!src || strcmp(src, "west") != 0) all_west = 0;
+            count++;
+        }
+        sqlite3_finalize(stmt);
+    }
+    /* west has 3 rows: Charlie, Diana, Eve */
+    test_report("snapshot_source_db: returns 3 west rows", count == 3);
+    test_report("snapshot_source_db: all from west", all_west);
+
+    sqlite3_exec(db, "DROP TABLE users", NULL, NULL, NULL);
+    sqlite3_close(db);
+    cleanup_test_files();
+}
+
+static void test_vtab_snapshot_rowid(void)
+{
+    setup_test_environment();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE users USING clearprism("
+        "  registry_db='%s', table='users', mode='snapshot')", REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT rowid, name FROM users", -1, &stmt, NULL);
+    test_report("snapshot_rowid: prepare", rc == SQLITE_OK);
+
+    int count = 0;
+    int all_nonzero = 1;
+    int64_t rowids[8];
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW && count < 8) {
+            rowids[count] = sqlite3_column_int64(stmt, 0);
+            if (rowids[count] == 0) all_nonzero = 0;
+            count++;
+        }
+        sqlite3_finalize(stmt);
+    }
+    test_report("snapshot_rowid: returns 6 rows", count == 6);
+    test_report("snapshot_rowid: all nonzero rowids", all_nonzero);
+
+    /* Verify rowids are unique */
+    int unique = 1;
+    for (int i = 0; i < count && unique; i++)
+        for (int j = i + 1; j < count && unique; j++)
+            if (rowids[i] == rowids[j]) unique = 0;
+    test_report("snapshot_rowid: all rowids unique", unique);
+
+    sqlite3_exec(db, "DROP TABLE users", NULL, NULL, NULL);
+    sqlite3_close(db);
+    cleanup_test_files();
+}
+
+static void test_vtab_snapshot_limit_offset(void)
+{
+    setup_test_environment();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE users USING clearprism("
+        "  registry_db='%s', table='users', mode='snapshot')", REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* LIMIT */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM users LIMIT 3", -1, &stmt, NULL);
+    test_report("snapshot_limit_offset: LIMIT prepare", rc == SQLITE_OK);
+
+    int count = 0;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) count++;
+        sqlite3_finalize(stmt);
+    }
+    test_report("snapshot_limit_offset: LIMIT 3 returns 3 rows", count == 3);
+
+    /* LIMIT + OFFSET */
+    rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM users LIMIT 2 OFFSET 2", -1, &stmt, NULL);
+    test_report("snapshot_limit_offset: OFFSET prepare", rc == SQLITE_OK);
+
+    count = 0;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) count++;
+        sqlite3_finalize(stmt);
+    }
+    test_report("snapshot_limit_offset: LIMIT 2 OFFSET 2 returns 2 rows", count == 2);
+
+    sqlite3_exec(db, "DROP TABLE users", NULL, NULL, NULL);
+    sqlite3_close(db);
+    cleanup_test_files();
+}
+
+static void test_vtab_snapshot_orderby(void)
+{
+    setup_test_environment();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE users USING clearprism("
+        "  registry_db='%s', table='users', mode='snapshot')", REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM users ORDER BY name ASC", -1, &stmt, NULL);
+    test_report("snapshot_orderby: prepare", rc == SQLITE_OK);
+
+    int count = 0;
+    int ordered = 1;
+    const char *prev = NULL;
+    char prev_buf[256] = {0};
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(stmt, 0);
+            if (prev && name && strcmp(name, prev_buf) < 0) ordered = 0;
+            if (name) { strncpy(prev_buf, name, sizeof(prev_buf) - 1); prev = prev_buf; }
+            count++;
+        }
+        sqlite3_finalize(stmt);
+    }
+    test_report("snapshot_orderby: returns 6 rows", count == 6);
+    test_report("snapshot_orderby: correctly ordered ASC", ordered);
+
+    sqlite3_exec(db, "DROP TABLE users", NULL, NULL, NULL);
+    sqlite3_close(db);
+    cleanup_test_files();
+}
+
+static void test_vtab_snapshot_l1_cache(void)
+{
+    setup_test_environment();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE users USING clearprism("
+        "  registry_db='%s', table='users', mode='snapshot')", REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* First query: cold — populates L1 cache */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM users WHERE _source_db = 'west'", -1, &stmt, NULL);
+    test_report("snapshot_l1_cache: first prepare", rc == SQLITE_OK);
+
+    int count1 = 0;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) count1++;
+        sqlite3_finalize(stmt);
+    }
+    test_report("snapshot_l1_cache: first returns 3 rows", count1 == 3);
+
+    /* Second query: same query, should be served from L1 cache */
+    rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM users WHERE _source_db = 'west'", -1, &stmt, NULL);
+    test_report("snapshot_l1_cache: second prepare", rc == SQLITE_OK);
+
+    int count2 = 0;
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) count2++;
+        sqlite3_finalize(stmt);
+    }
+    test_report("snapshot_l1_cache: cached returns same count", count2 == count1);
+
+    sqlite3_exec(db, "DROP TABLE users", NULL, NULL, NULL);
+    sqlite3_close(db);
+    cleanup_test_files();
+}
+
+static void test_vtab_snapshot_destroy(void)
+{
+    setup_test_environment();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE users USING clearprism("
+        "  registry_db='%s', table='users', mode='snapshot')", REG_PATH);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+
+    /* Verify shadow table exists */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM _clearprism_snap_users", -1, &stmt, NULL);
+    test_report("snapshot_destroy: shadow table exists", rc == SQLITE_OK);
+    if (rc == SQLITE_OK) {
+        sqlite3_step(stmt);
+        int cnt = sqlite3_column_int(stmt, 0);
+        test_report("snapshot_destroy: shadow table has 6 rows", cnt == 6);
+        sqlite3_finalize(stmt);
+    }
+
+    /* DROP TABLE should drop the shadow table too */
+    rc = sqlite3_exec(db, "DROP TABLE users", NULL, NULL, NULL);
+    test_report("snapshot_destroy: DROP TABLE succeeds", rc == SQLITE_OK);
+
+    /* Verify shadow table is gone */
+    rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM _clearprism_snap_users", -1, &stmt, NULL);
+    test_report("snapshot_destroy: shadow table dropped", rc != SQLITE_OK);
+    if (rc == SQLITE_OK) sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    cleanup_test_files();
+}
+
 int test_vtab_run(void)
 {
     test_vtab_basic_select();
@@ -2090,6 +2427,16 @@ int test_vtab_run(void)
     test_lazy_prefetch_all_rows();
     test_drain_limit_early_termination();
     test_order_limit_vs_full_order();
+
+    /* Snapshot mode tests */
+    test_vtab_snapshot_basic();
+    test_vtab_snapshot_where();
+    test_vtab_snapshot_source_db();
+    test_vtab_snapshot_rowid();
+    test_vtab_snapshot_limit_offset();
+    test_vtab_snapshot_orderby();
+    test_vtab_snapshot_l1_cache();
+    test_vtab_snapshot_destroy();
 
     return 0;
 }

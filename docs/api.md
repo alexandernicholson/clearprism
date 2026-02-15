@@ -311,6 +311,160 @@ void clearprism_cache_cursor_free(clearprism_cache_cursor *cc);
 
 Cache cursor iteration. Works for both L1 (linked list traversal) and L2 (statement stepping) cached results.
 
+## Scanner API
+
+The Scanner API provides a streaming interface for high-throughput bulk iteration across federated sources. It bypasses the SQLite virtual table protocol entirely, reading directly from source databases via the connection pool. Column accessors return zero-copy pointers into the source statement's memory, valid until the next `clearprism_scan_next()` call.
+
+Use the Scanner API when you need maximum read throughput (bulk ETL, analytics, exports). Use the virtual table when you need SQL convenience, caching, ORDER BY across sources, or integration with other SQLite features.
+
+### clearprism_scan_open
+
+```c
+clearprism_scanner *clearprism_scan_open(const char *registry_db,
+                                          const char *table);
+```
+
+Opens a scanner for the given registry and table. Internally:
+1. Opens the registry and snapshots the active source list
+2. Discovers the table schema from the first available source via `PRAGMA table_info`
+3. Builds the base SQL (`SELECT rowid, col1, col2, ... FROM table`)
+4. Creates a connection pool
+
+**Returns**: Allocated scanner, or `NULL` if the registry is unreachable, no sources are active, or the table doesn't exist in any source.
+
+### clearprism_scan_next
+
+```c
+int clearprism_scan_next(clearprism_scanner *s);
+```
+
+Advances to the next row. On the first call, connects to the first source and steps to the first row. When a source is exhausted, automatically advances to the next source with rows (resilient — skips sources that fail to connect or prepare).
+
+**Returns**: 1 if a row is available, 0 when all sources are exhausted.
+
+### clearprism_scan_close
+
+```c
+void clearprism_scan_close(clearprism_scanner *s);
+```
+
+Closes the scanner. Finalizes the current statement, checks in the connection, frees all internal state (SQL strings, schema, bind values, sources, pool, registry). Safe to call with `NULL`.
+
+### clearprism_scan_int64
+
+```c
+int64_t clearprism_scan_int64(clearprism_scanner *s, int col);
+```
+
+Returns the value of column `col` (0-indexed) as a 64-bit integer. Returns 0 if the scanner has no current row.
+
+### clearprism_scan_double
+
+```c
+double clearprism_scan_double(clearprism_scanner *s, int col);
+```
+
+Returns the value of column `col` as a double. Returns 0.0 if the scanner has no current row.
+
+### clearprism_scan_text
+
+```c
+const char *clearprism_scan_text(clearprism_scanner *s, int col);
+```
+
+Returns the value of column `col` as a UTF-8 string. The returned pointer is **zero-copy** — it points directly into the SQLite statement's memory and is valid until the next `clearprism_scan_next()` call. Returns `NULL` if the scanner has no current row.
+
+### clearprism_scan_blob
+
+```c
+const void *clearprism_scan_blob(clearprism_scanner *s, int col, int *len);
+```
+
+Returns the value of column `col` as a blob. Sets `*len` to the byte length. The returned pointer is zero-copy (valid until the next `clearprism_scan_next()` call). Returns `NULL` if the scanner has no current row.
+
+### clearprism_scan_type
+
+```c
+int clearprism_scan_type(clearprism_scanner *s, int col);
+```
+
+Returns the SQLite type code (`SQLITE_INTEGER`, `SQLITE_FLOAT`, `SQLITE_TEXT`, `SQLITE_BLOB`, `SQLITE_NULL`) for column `col` in the current row.
+
+### clearprism_scan_is_null
+
+```c
+int clearprism_scan_is_null(clearprism_scanner *s, int col);
+```
+
+Returns 1 if column `col` is NULL, 0 otherwise.
+
+### clearprism_scan_source_alias
+
+```c
+const char *clearprism_scan_source_alias(clearprism_scanner *s);
+```
+
+Returns the alias of the current source database (e.g., `"east"`, `"west"`). Equivalent to the `_source_db` hidden column in the virtual table. Returns `NULL` if no source is active.
+
+### clearprism_scan_source_id
+
+```c
+int64_t clearprism_scan_source_id(clearprism_scanner *s);
+```
+
+Returns the numeric ID of the current source database (from the registry's `id` column).
+
+### clearprism_scan_column_count
+
+```c
+int clearprism_scan_column_count(clearprism_scanner *s);
+```
+
+Returns the number of columns in the scanned table (excluding rowid).
+
+### clearprism_scan_column_name
+
+```c
+const char *clearprism_scan_column_name(clearprism_scanner *s, int col);
+```
+
+Returns the name of column `col` (0-indexed). Returns `NULL` if `col` is out of range.
+
+### clearprism_scan_filter
+
+```c
+int clearprism_scan_filter(clearprism_scanner *s, const char *where_expr);
+```
+
+Sets a WHERE clause expression for the scan. Must be called **before** the first `clearprism_scan_next()` call (returns `SQLITE_MISUSE` otherwise). The expression is appended as `WHERE <where_expr>` to the base SQL. Use `?` placeholders for parameter binding.
+
+**Returns**: `SQLITE_OK` on success.
+
+### clearprism_scan_bind_int64 / bind_double / bind_text / bind_null
+
+```c
+int clearprism_scan_bind_int64(clearprism_scanner *s, int idx, int64_t val);
+int clearprism_scan_bind_double(clearprism_scanner *s, int idx, double val);
+int clearprism_scan_bind_text(clearprism_scanner *s, int idx, const char *val);
+int clearprism_scan_bind_null(clearprism_scanner *s, int idx);
+```
+
+Bind parameter values for the WHERE expression set by `clearprism_scan_filter()`. `idx` is 1-based (matching SQLite's `?` numbering). Maximum 64 bind parameters (`CLEARPRISM_SCAN_MAX_BINDS`).
+
+**Returns**: `SQLITE_OK` on success, `SQLITE_MISUSE` if `idx` is out of range.
+
+### clearprism_scan_each
+
+```c
+int clearprism_scan_each(clearprism_scanner *s,
+                          int (*callback)(clearprism_scanner *s, void *ctx),
+                          void *ctx);
+```
+
+Callback-driven iteration. Calls `callback` for each row. If the callback returns non-zero, iteration stops and that value is returned. Useful for aggregation or early termination patterns.
+
+**Returns**: `SQLITE_OK` if all rows were consumed, or the callback's non-zero return value.
+
 ## WHERE Clause Handling
 
 ### clearprism_where_encode

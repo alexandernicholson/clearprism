@@ -45,7 +45,16 @@ Expected output:
   PASS: SELECT returns 6 rows total
   ...
 
-=== Results: 81/81 passed ===
+[Aggregate Pushdown Tests]
+  PASS: agg_count_all
+  ...
+
+[Scanner API Tests]
+  PASS: basic_full_scan
+  PASS: column_accessors
+  ...
+
+=== Results: 202/202 passed ===
 ```
 
 ## Test Structure
@@ -59,6 +68,8 @@ All tests are in the `test/` directory:
 | `test_connpool.c` | Connection pool | Create/destroy, checkout/checkin, connection reuse, multiple DBs, LRU eviction, invalid paths |
 | `test_cache.c` | L1 + unified cache | Create/destroy, insert/lookup, LRU eviction, TTL expiry (2s sleep), unified cache facade |
 | `test_vtab.c` | End-to-end virtual table | Basic SELECT across 3 sources, `_source_db` filter, WHERE pushdown (LIKE, EQ, NE, GLOB, IS NULL, IS NOT NULL, IN), empty results, cache_db mode, composite rowids (stable + lookup), L1 cache population, OFFSET, ORDER BY (single-source), combined queries, registry auto-reload |
+| `test_agg.c` | Aggregate pushdown | COUNT, SUM, MIN, MAX, AVG, GROUP BY pushdown |
+| `test_scanner.c` | Scanner API | Full scan, column accessors, source alias/id, column metadata, WHERE filter/range, callback iteration, early stop, empty sources, single source, NULL handling |
 
 ## Test Framework
 
@@ -157,6 +168,25 @@ users: (20, 'Frank', 'frank@north.com')
 | `test_vtab_orderby_single_source` | `WHERE _source_db = 'west' ORDER BY name DESC` returns correctly ordered rows |
 | `test_vtab_in` | `WHERE name IN ('Alice', 'Charlie', 'Frank')` returns exactly 3 matching rows |
 | `test_vtab_combined` | Combined WHERE + ORDER BY + LIMIT on single source returns correct result |
+
+### Scanner API Tests
+
+| Test | Validates |
+|------|-----------|
+| `test_scanner_basic_full_scan` | Opens scanner, iterates all rows across 3 sources, verifies total count |
+| `test_scanner_column_accessors` | Verifies `scan_int64`, `scan_text`, `scan_double` return correct values |
+| `test_scanner_source_alias` | `scan_source_alias()` returns correct alias for rows from each source |
+| `test_scanner_column_metadata` | `scan_column_count` and `scan_column_name` reflect the table schema |
+| `test_scanner_where_filter` | `scan_filter("category = ?")` with bound text returns only matching rows |
+| `test_scanner_where_range` | `scan_filter("value > ? AND value < ?")` with bound doubles returns correct range |
+| `test_scanner_scan_each` | `scan_each()` callback receives all rows, context accumulator works |
+| `test_scanner_early_stop` | `scan_each()` stops when callback returns non-zero |
+| `test_scanner_empty_sources` | Scanner with sources containing no matching data returns 0 rows |
+| `test_scanner_single_source` | Scanner with 1 source returns correct rows |
+| `test_scanner_null_handling` | `scan_is_null()` correctly detects NULL values |
+| `test_scanner_source_id` | `scan_source_id()` returns numeric source IDs from the registry |
+
+The scanner tests create a fresh registry + source databases in `/tmp` with a schema of `items (id INTEGER PRIMARY KEY, category TEXT, name TEXT, value REAL)`.
 
 ## Writing New Tests
 

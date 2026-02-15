@@ -216,6 +216,40 @@ If the number of sources exceeds the configured `pool_max_open`, the pool limit 
 
 For multi-source `ORDER BY` queries, each source's SQL includes the `ORDER BY` clause. A min-heap over the source handles produces globally sorted output by repeatedly extracting the minimum element and stepping that source forward. This avoids materializing all rows before sorting.
 
+## Scanner API Architecture
+
+The Scanner API (`clearprism_scanner.c`) provides a streaming iteration interface that bypasses the SQLite virtual table protocol entirely. While the vtab interface is ideal for SQL integration and caching, it incurs inherent per-row overhead from the VDBE dispatch loop (xEof + xNext + xColumn×N + xRowid per row). For bulk scans across many sources, this overhead is ~2x vs direct SQLite.
+
+The scanner eliminates this by iterating directly:
+
+```mermaid
+graph LR
+    APP["Application Code"] --> SCAN["clearprism_scanner"]
+    SCAN --> POOL["Connection Pool"]
+    POOL --> S1["Source DB 1"]
+    POOL --> S2["Source DB 2"]
+    POOL --> SN["Source DB N"]
+    S1 --> STEP["sqlite3_step() loop"]
+    S2 --> STEP
+    SN --> STEP
+    STEP --> COL["sqlite3_column_text/int64/...<br>(zero-copy)"]
+    COL --> APP
+```
+
+Key differences from the vtab path:
+
+| Aspect | Virtual Table | Scanner |
+|--------|--------------|---------|
+| Per-row calls | ~10 indirect calls via VDBE | 1 `sqlite3_step` + direct accessors |
+| Column access | `sqlite3_result_value` (deep copy) | `sqlite3_column_text` (zero-copy) |
+| Overhead vs direct | ~2x | ~1.09x |
+| WHERE pushdown | Automatic via xBestIndex | Manual via `scan_filter()` |
+| Caching | L1 + L2 | None |
+| ORDER BY | Merge-sort across sources | Per-source only |
+| SQL integration | Full (`SELECT`, `JOIN`, `GROUP BY`) | C API only |
+
+The scanner reuses the same registry and connection pool infrastructure as the vtab. Schema discovery uses the same `PRAGMA table_info` approach. Sources are iterated sequentially; failed sources are skipped (resilient).
+
 ## WHERE Pushdown
 
 The `clearprism_where.c` module handles translating SQLite's abstract constraint representation into executable SQL.
@@ -343,14 +377,28 @@ Measured on a typical workload (10 sources, 1K rows each, indexed category filte
 
 Cache hit rates dominate real-world performance. For repeated query patterns (dashboards, reports, API serving), the L1 cache delivers 30-70x speedup over manual multi-source federation.
 
+### Scanner Performance
+
+The Scanner API bypasses the virtual table protocol, eliminating per-row VDBE dispatch overhead. Measured on the federation benchmark (100 sources × 1M rows each = 100M rows):
+
+| API | Time | vs Direct SQLite |
+|-----|------|-----------------|
+| Direct SQLite (manual 100-source loop) | 46.4s | baseline |
+| Clearprism Scanner | 50.6s | **1.09x** |
+| Clearprism Virtual Table | 98.2s | 2.12x |
+
+The ~2x vtab overhead is structural to the SQLite virtual table protocol (xEof + xNext + xColumn×N + xRowid = ~10 indirect calls per row × 100M rows). The scanner eliminates this by calling `sqlite3_step()` and `sqlite3_column_*()` directly.
+
 ### Benchmarking
 
 Run `make bench` to execute the full benchmark suite:
 
 ```bash
-make bench                          # run all 7 scenarios (~60s)
+make bench                          # run all scenarios
 ./clearprism_bench baseline         # run one scenario
 ./clearprism_bench source_scale     # run one scenario
 ```
 
-Scenarios: `baseline`, `source_scale`, `cache`, `where`, `orderby`, `row_scale`, `concurrent`. Results are appended to `bench_results.csv` for tracking across runs.
+Scenarios: `baseline`, `source_scale`, `cache`, `where`, `orderby`, `row_scale`, `concurrent`, `federation`. Results are appended to `bench_results.csv` for tracking across runs.
+
+The `federation` scenario compares direct SQLite, virtual table, and scanner API on a full scan of 100 sources × 1M rows.

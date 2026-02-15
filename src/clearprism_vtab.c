@@ -112,6 +112,9 @@ static int vtab_parse_args(int argc, const char *const *argv,
             vtab->pool_max_open = atoi(value);
         } else if (strcmp(key, "l2_refresh_sec") == 0) {
             vtab->l2_refresh_interval_sec = atoi(value);
+        } else if (strcmp(key, "mode") == 0) {
+            if (strcmp(value, "snapshot") == 0)
+                vtab->snapshot_mode = 1;
         }
         /* else: unknown key, silently ignore */
 
@@ -337,7 +340,7 @@ static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr)
 }
 
 static int vtab_init(sqlite3 *db, int argc, const char *const *argv,
-                      sqlite3_vtab **ppVtab, char **pzErr)
+                      sqlite3_vtab **ppVtab, char **pzErr, int is_create)
 {
     clearprism_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
     if (!vtab) {
@@ -386,6 +389,24 @@ static int vtab_init(sqlite3 *db, int argc, const char *const *argv,
         return rc;
     }
 
+    /* Snapshot mode setup */
+    if (vtab->snapshot_mode) {
+        vtab->snapshot_table = clearprism_mprintf("_clearprism_snap_%s", argv[2]);
+        if (!vtab->snapshot_table) {
+            *pzErr = clearprism_strdup("clearprism: out of memory for snapshot table name");
+            vtab_free(vtab);
+            return SQLITE_NOMEM;
+        }
+        if (is_create) {
+            rc = clearprism_snapshot_populate(vtab);
+            if (rc != SQLITE_OK) {
+                *pzErr = clearprism_mprintf("clearprism: snapshot population failed");
+                vtab_free(vtab);
+                return rc;
+            }
+        }
+    }
+
     /* Register vtab in global map for aggregate function lookup */
     clearprism_register_vtab(vtab->target_table, vtab);
 
@@ -398,7 +419,7 @@ int clearprism_vtab_create(sqlite3 *db, void *pAux, int argc,
                             char **pzErr)
 {
     (void)pAux;
-    return vtab_init(db, argc, argv, ppVtab, pzErr);
+    return vtab_init(db, argc, argv, ppVtab, pzErr, 1);
 }
 
 int clearprism_vtab_connect(sqlite3 *db, void *pAux, int argc,
@@ -406,7 +427,7 @@ int clearprism_vtab_connect(sqlite3 *db, void *pAux, int argc,
                              char **pzErr)
 {
     (void)pAux;
-    return vtab_init(db, argc, argv, ppVtab, pzErr);
+    return vtab_init(db, argc, argv, ppVtab, pzErr, 0);
 }
 
 static void vtab_free(clearprism_vtab *vtab)
@@ -426,6 +447,7 @@ static void vtab_free(clearprism_vtab *vtab)
     sqlite3_free(vtab->target_table);
     sqlite3_free(vtab->cache_db_path);
     sqlite3_free(vtab->create_table_sql);
+    sqlite3_free(vtab->snapshot_table);
 
     if (vtab->cols) {
         for (int i = 0; i < vtab->nCol; i++) {
@@ -447,7 +469,21 @@ int clearprism_vtab_disconnect(sqlite3_vtab *pVtab)
 
 int clearprism_vtab_destroy(sqlite3_vtab *pVtab)
 {
-    vtab_free((clearprism_vtab *)pVtab);
+    clearprism_vtab *vtab = (clearprism_vtab *)pVtab;
+    if (vtab->snapshot_table) {
+        char *sql = clearprism_mprintf("DROP TABLE IF EXISTS \"%s\"", vtab->snapshot_table);
+        if (sql) {
+            sqlite3_exec(vtab->host_db, sql, NULL, NULL, NULL);
+            sqlite3_free(sql);
+        }
+        /* Also drop the index */
+        char *idx_sql = clearprism_mprintf("DROP INDEX IF EXISTS \"%s_src\"", vtab->snapshot_table);
+        if (idx_sql) {
+            sqlite3_exec(vtab->host_db, idx_sql, NULL, NULL, NULL);
+            sqlite3_free(idx_sql);
+        }
+    }
+    vtab_free(vtab);
     return SQLITE_OK;
 }
 
@@ -522,6 +558,12 @@ int clearprism_vtab_close(sqlite3_vtab_cursor *pCur)
         for (int i = 0; i < cur->n_sources; i++)
             sqlite3_value_free(cur->alias_values[i]);
         sqlite3_free(cur->alias_values);
+    }
+
+    /* Free snapshot statement */
+    if (cur->snapshot_stmt) {
+        sqlite3_finalize(cur->snapshot_stmt);
+        cur->snapshot_stmt = NULL;
     }
 
     /* Free pre-generated SQL */

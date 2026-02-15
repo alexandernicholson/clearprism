@@ -286,6 +286,10 @@ struct clearprism_vtab {
 
     /* Persistent worker thread pool (created at vtab init) */
     clearprism_work_pool *work_pool;
+
+    /* Snapshot mode */
+    int   snapshot_mode;      /* 1 if mode='snapshot' */
+    char *snapshot_table;     /* "_clearprism_snap_{vtab_name}" */
 };
 
 /* ---------- Cursor ---------- */
@@ -357,6 +361,10 @@ struct clearprism_cursor {
 
     /* Cached ORDER BY column types for fast merge-sort comparison */
     int     *order_col_types;
+
+    /* Snapshot mode serving */
+    sqlite3_stmt *snapshot_stmt;         /* prepared SELECT against shadow table */
+    int           serving_from_snapshot;
 
     /* Parallel drain — materialized flat buffer (Optimization 1) */
     clearprism_l1_row *drain_rows;
@@ -487,6 +495,9 @@ int  clearprism_cache_cursor_eof(clearprism_cache_cursor *cc);
 sqlite3_value *clearprism_cache_cursor_value(clearprism_cache_cursor *cc,
                                               int iCol);
 
+/* clearprism_query.c — Snapshot mode */
+int clearprism_snapshot_populate(clearprism_vtab *vtab);
+
 /* clearprism_query.c — Worker thread pool */
 clearprism_work_pool *clearprism_work_pool_create(int n_threads);
 void clearprism_work_pool_destroy(clearprism_work_pool *pool);
@@ -500,5 +511,95 @@ int clearprism_register_agg_functions(sqlite3 *db);
 void clearprism_register_vtab(const char *table, clearprism_vtab *vtab);
 void clearprism_unregister_vtab(const char *table);
 clearprism_vtab *clearprism_lookup_vtab(const char *table);
+
+/* ---------- Streaming Scanner API ---------- */
+
+/* Maximum bind parameters for scanner WHERE filter */
+#define CLEARPRISM_SCAN_MAX_BINDS 64
+
+typedef struct clearprism_scanner clearprism_scanner;
+
+/* Stored bind value for per-source statement preparation */
+typedef struct clearprism_scan_bind clearprism_scan_bind;
+struct clearprism_scan_bind {
+    int type;   /* SQLITE_INTEGER / SQLITE_FLOAT / SQLITE_TEXT / SQLITE_NULL */
+    union {
+        int64_t i;
+        double  d;
+    } u;
+    char *text;  /* owned copy for SQLITE_TEXT / SQLITE_BLOB */
+    int   text_len;
+};
+
+struct clearprism_scanner {
+    /* Registry + sources */
+    clearprism_registry *registry;
+    clearprism_source   *sources;
+    int                  n_sources;
+    int                  owns_registry;  /* 1 if we opened it, 0 if borrowed */
+
+    /* Connection pool */
+    clearprism_connpool *pool;
+    int                  owns_pool;
+
+    /* Schema */
+    char                *target_table;
+    clearprism_col_def  *cols;
+    int                  n_cols;
+
+    /* Current iteration state */
+    int                  current_source;
+    sqlite3             *current_conn;
+    sqlite3_stmt        *current_stmt;
+    int                  started;  /* 1 after first scan_next call */
+    int                  eof;
+
+    /* Generated SQL */
+    char                *base_sql;   /* SELECT rowid, col1, ... FROM table */
+    char                *filter_sql; /* full SQL with WHERE appended */
+
+    /* WHERE filter + bind values */
+    char                *where_expr;
+    clearprism_scan_bind binds[CLEARPRISM_SCAN_MAX_BINDS];
+    int                  n_binds;
+};
+
+/* Lifecycle */
+clearprism_scanner *clearprism_scan_open(const char *registry_db,
+                                          const char *table);
+int   clearprism_scan_next(clearprism_scanner *s);
+void  clearprism_scan_close(clearprism_scanner *s);
+
+/* Column accessors — zero-copy, valid until next scan_next call */
+int64_t     clearprism_scan_int64(clearprism_scanner *s, int col);
+double      clearprism_scan_double(clearprism_scanner *s, int col);
+const char *clearprism_scan_text(clearprism_scanner *s, int col);
+const void *clearprism_scan_blob(clearprism_scanner *s, int col, int *len);
+int         clearprism_scan_type(clearprism_scanner *s, int col);
+int         clearprism_scan_is_null(clearprism_scanner *s, int col);
+
+/* Rowid and value accessors */
+int64_t      clearprism_scan_rowid(clearprism_scanner *s);
+sqlite3_value *clearprism_scan_value(clearprism_scanner *s, int col);
+
+/* Source identification (valid during current row) */
+const char *clearprism_scan_source_alias(clearprism_scanner *s);
+int64_t     clearprism_scan_source_id(clearprism_scanner *s);
+
+/* Column metadata */
+int         clearprism_scan_column_count(clearprism_scanner *s);
+const char *clearprism_scan_column_name(clearprism_scanner *s, int col);
+
+/* WHERE filtering — call before first scan_next */
+int  clearprism_scan_filter(clearprism_scanner *s, const char *where_expr);
+int  clearprism_scan_bind_int64(clearprism_scanner *s, int idx, int64_t val);
+int  clearprism_scan_bind_double(clearprism_scanner *s, int idx, double val);
+int  clearprism_scan_bind_text(clearprism_scanner *s, int idx, const char *val);
+int  clearprism_scan_bind_null(clearprism_scanner *s, int idx);
+
+/* Callback iteration */
+int  clearprism_scan_each(clearprism_scanner *s,
+                           int (*callback)(clearprism_scanner *s, void *ctx),
+                           void *ctx);
 
 #endif /* CLEARPRISM_H */

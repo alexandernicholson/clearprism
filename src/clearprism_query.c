@@ -32,6 +32,7 @@ static void cursor_precreate_alias_values(clearprism_cursor *cur);
 static void cursor_free_alias_values(clearprism_cursor *cur);
 static void cursor_free_drain(clearprism_cursor *cur);
 static void cursor_flush_drain_to_l1(clearprism_cursor *cur);
+static void cursor_buffer_snapshot_row(clearprism_cursor *cur);
 static void *prefetch_worker(void *arg);
 
 /* Merge-sort heap helpers */
@@ -602,6 +603,332 @@ void clearprism_cursor_flush_drain(clearprism_cursor *cur)
     cursor_free_drain(cur);
 }
 
+/* ========== Snapshot mode ========== */
+
+/*
+ * Build a SELECT query against the snapshot shadow table.
+ * Uses numbered ?N parameters matching argv indices for clean binding.
+ */
+static char *snapshot_build_query(clearprism_vtab *vtab, clearprism_query_plan *plan)
+{
+    /* Build column list: rowid, "col1", ..., "_source_db" */
+    size_t col_buf_size = 256;
+    for (int i = 0; i < vtab->nCol; i++)
+        col_buf_size += strlen(vtab->cols[i].name) + 4;
+
+    char *col_list = sqlite3_malloc((int)col_buf_size);
+    if (!col_list) return NULL;
+
+    int pos = 0;
+    pos += snprintf(col_list + pos, col_buf_size - pos, "rowid");
+    for (int i = 0; i < vtab->nCol; i++)
+        pos += snprintf(col_list + pos, col_buf_size - pos, ", \"%s\"", vtab->cols[i].name);
+    pos += snprintf(col_list + pos, col_buf_size - pos, ", \"_source_db\"");
+
+    /* Build WHERE clause */
+    char *where = NULL;
+    int where_pos = 0;
+    int where_size = 0;
+
+    if (plan && plan->n_constraints > 0) {
+        where_size = 256;
+        where = sqlite3_malloc(where_size);
+        if (!where) { sqlite3_free(col_list); return NULL; }
+        where[0] = '\0';
+
+        int first = 1;
+        for (int i = 0; i < plan->n_constraints; i++) {
+            int col = plan->constraints[i].col_idx;
+            int op = plan->constraints[i].op;
+            int ai = plan->constraints[i].argv_idx;
+
+            /* Skip LIMIT/OFFSET */
+#ifdef SQLITE_INDEX_CONSTRAINT_LIMIT
+            if (op == SQLITE_INDEX_CONSTRAINT_LIMIT) continue;
+#endif
+#ifdef SQLITE_INDEX_CONSTRAINT_OFFSET
+            if (op == SQLITE_INDEX_CONSTRAINT_OFFSET) continue;
+#endif
+            /* Skip IN constraints — let SQLite post-filter */
+            if (plan->constraints[i].is_in) continue;
+
+            const char *col_name = NULL;
+            int is_rowid = 0;
+            if (col == -1) {
+                is_rowid = 1;
+            } else if (col == vtab->nCol) {
+                col_name = "_source_db";
+            } else if (col >= 0 && col < vtab->nCol) {
+                col_name = vtab->cols[col].name;
+            } else {
+                continue;
+            }
+
+            const char *op_str = NULL;
+            int is_unary = 0;
+            switch (op) {
+                case SQLITE_INDEX_CONSTRAINT_EQ:   op_str = "=";    break;
+                case SQLITE_INDEX_CONSTRAINT_GT:   op_str = ">";    break;
+                case SQLITE_INDEX_CONSTRAINT_GE:   op_str = ">=";   break;
+                case SQLITE_INDEX_CONSTRAINT_LT:   op_str = "<";    break;
+                case SQLITE_INDEX_CONSTRAINT_LE:   op_str = "<=";   break;
+                case SQLITE_INDEX_CONSTRAINT_LIKE: op_str = "LIKE"; break;
+#ifdef SQLITE_INDEX_CONSTRAINT_NE
+                case SQLITE_INDEX_CONSTRAINT_NE:   op_str = "!=";   break;
+#endif
+#ifdef SQLITE_INDEX_CONSTRAINT_GLOB
+                case SQLITE_INDEX_CONSTRAINT_GLOB: op_str = "GLOB"; break;
+#endif
+#ifdef SQLITE_INDEX_CONSTRAINT_ISNULL
+                case SQLITE_INDEX_CONSTRAINT_ISNULL:
+                    op_str = "IS NULL"; is_unary = 1; break;
+#endif
+#ifdef SQLITE_INDEX_CONSTRAINT_ISNOTNULL
+                case SQLITE_INDEX_CONSTRAINT_ISNOTNULL:
+                    op_str = "IS NOT NULL"; is_unary = 1; break;
+#endif
+                default: continue;
+            }
+
+            if (!first)
+                where_pos += snprintf(where + where_pos, where_size - where_pos, " AND ");
+            first = 0;
+
+            int needed = 64;
+            if (col_name) needed += (int)strlen(col_name);
+            if (where_pos + needed >= where_size) {
+                where_size = where_size * 2 + needed;
+                where = sqlite3_realloc(where, where_size);
+                if (!where) { sqlite3_free(col_list); return NULL; }
+            }
+
+            if (is_rowid) {
+                if (is_unary)
+                    where_pos += snprintf(where + where_pos, where_size - where_pos,
+                                           "rowid %s", op_str);
+                else
+                    where_pos += snprintf(where + where_pos, where_size - where_pos,
+                                           "rowid %s ?%d", op_str, ai);
+            } else if (is_unary) {
+                where_pos += snprintf(where + where_pos, where_size - where_pos,
+                                       "\"%s\" %s", col_name, op_str);
+            } else {
+                where_pos += snprintf(where + where_pos, where_size - where_pos,
+                                       "\"%s\" %s ?%d", col_name, op_str, ai);
+            }
+        }
+    }
+
+    /* Build ORDER BY clause */
+    char *order_by = NULL;
+    if (plan && plan->n_order_cols > 0) {
+        int ob_size = 256;
+        order_by = sqlite3_malloc(ob_size);
+        if (order_by) {
+            int ob_pos = 0;
+            for (int i = 0; i < plan->n_order_cols; i++) {
+                int ci = plan->order_cols[i].col_idx;
+                if (ci < 0 || ci >= vtab->nCol) continue;
+                if (ob_pos > 0) ob_pos += snprintf(order_by + ob_pos, ob_size - ob_pos, ", ");
+                ob_pos += snprintf(order_by + ob_pos, ob_size - ob_pos, "\"%s\" %s",
+                                    vtab->cols[ci].name, plan->order_cols[i].desc ? "DESC" : "ASC");
+            }
+        }
+    }
+
+    /* Assemble full SQL */
+    char *sql;
+    if (where && where[0] != '\0' && order_by && order_by[0] != '\0') {
+        sql = clearprism_mprintf("SELECT %s FROM \"%s\" WHERE %s ORDER BY %s",
+                                  col_list, vtab->snapshot_table, where, order_by);
+    } else if (where && where[0] != '\0') {
+        sql = clearprism_mprintf("SELECT %s FROM \"%s\" WHERE %s",
+                                  col_list, vtab->snapshot_table, where);
+    } else if (order_by && order_by[0] != '\0') {
+        sql = clearprism_mprintf("SELECT %s FROM \"%s\" ORDER BY %s",
+                                  col_list, vtab->snapshot_table, order_by);
+    } else {
+        sql = clearprism_mprintf("SELECT %s FROM \"%s\"",
+                                  col_list, vtab->snapshot_table);
+    }
+
+    sqlite3_free(col_list);
+    sqlite3_free(where);
+    sqlite3_free(order_by);
+    return sql;
+}
+
+/*
+ * Populate the snapshot shadow table using the scanner API.
+ * Called once from xCreate when mode='snapshot'.
+ */
+int clearprism_snapshot_populate(clearprism_vtab *vtab)
+{
+    int rc;
+
+    /* 1. Build CREATE TABLE for the shadow table */
+    size_t ct_size = 256 + strlen(vtab->snapshot_table);
+    for (int i = 0; i < vtab->nCol; i++)
+        ct_size += strlen(vtab->cols[i].name) + (vtab->cols[i].type ? strlen(vtab->cols[i].type) : 0) + 16;
+
+    char *create_sql = sqlite3_malloc((int)ct_size);
+    if (!create_sql) return SQLITE_NOMEM;
+
+    int pos = snprintf(create_sql, ct_size, "CREATE TABLE IF NOT EXISTS \"%s\"(", vtab->snapshot_table);
+    for (int i = 0; i < vtab->nCol; i++) {
+        if (i > 0) pos += snprintf(create_sql + pos, ct_size - pos, ", ");
+        pos += snprintf(create_sql + pos, ct_size - pos, "\"%s\"", vtab->cols[i].name);
+        if (vtab->cols[i].type && vtab->cols[i].type[0])
+            pos += snprintf(create_sql + pos, ct_size - pos, " %s", vtab->cols[i].type);
+    }
+    pos += snprintf(create_sql + pos, ct_size - pos, ", \"_source_db\" TEXT)");
+
+    rc = sqlite3_exec(vtab->host_db, create_sql, NULL, NULL, NULL);
+    sqlite3_free(create_sql);
+    if (rc != SQLITE_OK) return rc;
+
+    /* 2. Open scanner */
+    clearprism_scanner *sc = clearprism_scan_open(vtab->registry_path, vtab->target_table);
+    if (!sc) return SQLITE_ERROR;
+
+    /* 3. Build INSERT statement */
+    size_t ins_size = 256 + strlen(vtab->snapshot_table);
+    for (int i = 0; i < vtab->nCol; i++)
+        ins_size += strlen(vtab->cols[i].name) + 8;
+
+    char *ins_sql = sqlite3_malloc((int)ins_size);
+    if (!ins_sql) {
+        clearprism_scan_close(sc);
+        return SQLITE_NOMEM;
+    }
+
+    pos = snprintf(ins_sql, ins_size, "INSERT INTO \"%s\"(rowid", vtab->snapshot_table);
+    for (int i = 0; i < vtab->nCol; i++)
+        pos += snprintf(ins_sql + pos, ins_size - pos, ", \"%s\"", vtab->cols[i].name);
+    pos += snprintf(ins_sql + pos, ins_size - pos, ", \"_source_db\") VALUES (?");
+    for (int i = 0; i < vtab->nCol; i++)
+        pos += snprintf(ins_sql + pos, ins_size - pos, ", ?");
+    pos += snprintf(ins_sql + pos, ins_size - pos, ", ?)");
+
+    sqlite3_stmt *ins = NULL;
+    rc = sqlite3_prepare_v2(vtab->host_db, ins_sql, -1, &ins, NULL);
+    sqlite3_free(ins_sql);
+    if (rc != SQLITE_OK) {
+        clearprism_scan_close(sc);
+        return rc;
+    }
+
+    /* 4. Loop: scan all rows and insert
+     * Note: xCreate runs inside SQLite's implicit transaction for
+     * CREATE VIRTUAL TABLE, so we don't need our own BEGIN/COMMIT. */
+    while (clearprism_scan_next(sc)) {
+        int64_t source_id = clearprism_scan_source_id(sc);
+        int64_t source_rowid = clearprism_scan_rowid(sc);
+        int64_t composite_rowid = (source_id << CLEARPRISM_ROWID_SHIFT) |
+                                   (source_rowid & CLEARPRISM_ROWID_MASK);
+
+        sqlite3_bind_int64(ins, 1, composite_rowid);
+
+        for (int c = 0; c < vtab->nCol; c++) {
+            sqlite3_value *val = clearprism_scan_value(sc, c);
+            if (val)
+                sqlite3_bind_value(ins, c + 2, val);
+            else
+                sqlite3_bind_null(ins, c + 2);
+        }
+
+        const char *alias = clearprism_scan_source_alias(sc);
+        if (alias)
+            sqlite3_bind_text(ins, vtab->nCol + 2, alias, -1, SQLITE_TRANSIENT);
+        else
+            sqlite3_bind_null(ins, vtab->nCol + 2);
+
+        sqlite3_step(ins);
+        sqlite3_reset(ins);
+    }
+
+    /* 5. Finalize and close scanner */
+    sqlite3_finalize(ins);
+    clearprism_scan_close(sc);
+
+    /* 7. Create index on _source_db */
+    char *idx_sql = clearprism_mprintf(
+        "CREATE INDEX IF NOT EXISTS \"%s_src\" ON \"%s\"(\"_source_db\")",
+        vtab->snapshot_table, vtab->snapshot_table);
+    if (idx_sql) {
+        sqlite3_exec(vtab->host_db, idx_sql, NULL, NULL, NULL);
+        sqlite3_free(idx_sql);
+    }
+
+    return SQLITE_OK;
+}
+
+/*
+ * Buffer the current snapshot row into the L1 population buffer.
+ * Reads from cur->snapshot_stmt instead of source handles.
+ */
+static void cursor_buffer_snapshot_row(clearprism_cursor *cur)
+{
+    clearprism_vtab *vtab = cur->vtab;
+    sqlite3_stmt *stmt = cur->snapshot_stmt;
+
+    if (cur->buffer_overflow || !cur->cache_key || !vtab->cache || !stmt) return;
+
+    int n_cols = vtab->nCol + 1;  /* +1 for _source_db */
+
+    /* Lazy allocation of flat buffer arrays on first row */
+    if (!cur->buf_rows) {
+        int capacity = (int)vtab->l1_max_rows;
+        if (capacity <= 0) capacity = CLEARPRISM_DEFAULT_L1_MAX_ROWS;
+        cur->buf_rows = sqlite3_malloc(capacity * (int)sizeof(clearprism_l1_row));
+        cur->buf_values = sqlite3_malloc(capacity * n_cols * (int)sizeof(sqlite3_value *));
+        if (!cur->buf_rows || !cur->buf_values) {
+            sqlite3_free(cur->buf_rows);  cur->buf_rows = NULL;
+            sqlite3_free(cur->buf_values); cur->buf_values = NULL;
+            cur->buffer_overflow = 1;
+            return;
+        }
+        cur->buf_capacity = capacity;
+        cur->buf_n_cols = n_cols;
+    }
+
+    size_t row_overhead = sizeof(clearprism_l1_row) + n_cols * sizeof(sqlite3_value *);
+
+    if (cur->buffer_n_rows >= cur->buf_capacity ||
+        (int64_t)(cur->buffer_bytes + row_overhead) > vtab->l1_max_bytes) {
+        cur->buffer_overflow = 1;
+        cursor_free_buffer(cur);
+        return;
+    }
+
+    int row_idx = cur->buffer_n_rows;
+    clearprism_l1_row *row = &cur->buf_rows[row_idx];
+    sqlite3_value **vals = &cur->buf_values[row_idx * n_cols];
+
+    size_t row_bytes = row_overhead;
+
+    /* Copy real columns from snapshot stmt (offset by COL_OFFSET) */
+    for (int i = 0; i < vtab->nCol; i++) {
+        sqlite3_value *src = sqlite3_column_value(stmt, i + CLEARPRISM_COL_OFFSET);
+        vals[i] = sqlite3_value_dup(src);
+        row_bytes += clearprism_value_memsize(src);
+    }
+
+    /* Copy _source_db — at position nCol + COL_OFFSET in the snapshot SELECT */
+    sqlite3_value *src_db = sqlite3_column_value(stmt, vtab->nCol + CLEARPRISM_COL_OFFSET);
+    vals[vtab->nCol] = sqlite3_value_dup(src_db);
+    row_bytes += clearprism_value_memsize(src_db);
+
+    /* Composite rowid is stored directly in the shadow table's rowid (col 0) */
+    row->composite_rowid = sqlite3_column_int64(stmt, 0);
+    row->n_values = n_cols;
+    row->values = vals;
+    row->next = NULL;
+
+    cur->buffer_n_rows++;
+    cur->buffer_bytes += row_bytes;
+}
+
 /*
  * Transfer drain buffer ownership to L1 cache (zero-copy).
  * Avoids duplicating values that drain already materialized.
@@ -801,6 +1128,8 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     clearprism_vtab *vtab = cur->vtab;
 
     /* Clean up previous iteration state */
+    if (cur->snapshot_stmt) { sqlite3_finalize(cur->snapshot_stmt); cur->snapshot_stmt = NULL; }
+    cur->serving_from_snapshot = 0;
     cursor_free_drain(cur);
     cursor_cleanup_handles(cur);
     cursor_free_alias_values(cur);
@@ -971,7 +1300,7 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
         }
     }
 
-    /* Cache lookup */
+    /* Cache lookup (before snapshot path so snapshots can serve from L1) */
     char cache_key[512];
     cursor_build_cache_key(cur, argc, argv, cache_key, sizeof(cache_key));
 
@@ -989,6 +1318,62 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 
     cursor_free_buffer(cur);
     cur->cache_key = clearprism_strdup(cache_key);
+
+    /* Snapshot mode: query the shadow table directly */
+    if (vtab->snapshot_mode) {
+        if (cur->snapshot_stmt) { sqlite3_finalize(cur->snapshot_stmt); cur->snapshot_stmt = NULL; }
+        cur->serving_from_snapshot = 0;
+
+        /* Early buffer skip: don't cache if no L1 available */
+        if (!vtab->cache) cur->buffer_overflow = 1;
+
+        char *sql = snapshot_build_query(vtab, &cur->plan);
+        if (!sql) { cur->eof = 1; return SQLITE_OK; }
+
+        rc = sqlite3_prepare_v2(vtab->host_db, sql, -1, &cur->snapshot_stmt, NULL);
+        sqlite3_free(sql);
+        if (rc != SQLITE_OK) { cur->eof = 1; return SQLITE_OK; }
+
+        /* Bind non-LIMIT/OFFSET/unary/IN constraints using numbered ?N */
+        for (int i = 0; i < cur->plan.n_constraints; i++) {
+            int op = cur->plan.constraints[i].op;
+            int ai = cur->plan.constraints[i].argv_idx;
+            int skip = 0;
+#ifdef SQLITE_INDEX_CONSTRAINT_LIMIT
+            if (op == SQLITE_INDEX_CONSTRAINT_LIMIT) skip = 1;
+#endif
+#ifdef SQLITE_INDEX_CONSTRAINT_OFFSET
+            if (op == SQLITE_INDEX_CONSTRAINT_OFFSET) skip = 1;
+#endif
+#ifdef SQLITE_INDEX_CONSTRAINT_ISNULL
+            if (op == SQLITE_INDEX_CONSTRAINT_ISNULL) skip = 1;
+#endif
+#ifdef SQLITE_INDEX_CONSTRAINT_ISNOTNULL
+            if (op == SQLITE_INDEX_CONSTRAINT_ISNOTNULL) skip = 1;
+#endif
+            if (cur->plan.constraints[i].is_in) skip = 1;
+            if (skip) continue;
+
+            if (ai > 0 && ai <= cur->saved_argc && cur->saved_argv)
+                sqlite3_bind_value(cur->snapshot_stmt, ai, cur->saved_argv[ai - 1]);
+        }
+
+        /* OFFSET skip */
+        while (cur->offset_remaining > 0) {
+            if (sqlite3_step(cur->snapshot_stmt) != SQLITE_ROW) { cur->eof = 1; return SQLITE_OK; }
+            cur->offset_remaining--;
+        }
+
+        /* Step to first row */
+        if (sqlite3_step(cur->snapshot_stmt) != SQLITE_ROW) {
+            cur->eof = 1;
+            cursor_flush_buffer_to_l1(cur);
+        } else {
+            cursor_buffer_snapshot_row(cur);
+        }
+        cur->serving_from_snapshot = 1;
+        return SQLITE_OK;
+    }
 
     /* Rowid lookup fast-path */
     if (idxNum & CLEARPRISM_PLAN_ROWID_LOOKUP) {
@@ -1381,6 +1766,17 @@ int clearprism_vtab_next(sqlite3_vtab_cursor *pCur)
         }
     }
 
+    /* Snapshot serving path */
+    if (cur->serving_from_snapshot && cur->snapshot_stmt) {
+        if (sqlite3_step(cur->snapshot_stmt) != SQLITE_ROW) {
+            cur->eof = 1;
+            cursor_flush_buffer_to_l1(cur);
+        } else {
+            cursor_buffer_snapshot_row(cur);
+        }
+        return SQLITE_OK;
+    }
+
     /* Drain serving path */
     if (cur->serving_from_drain) {
         cur->drain_idx++;
@@ -1509,6 +1905,15 @@ int clearprism_vtab_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx,
         return SQLITE_OK;
     }
 
+    /* Snapshot serving path */
+    if (cur->serving_from_snapshot && cur->snapshot_stmt) {
+        if (iCol >= 0 && iCol <= vtab->nCol)
+            sqlite3_result_value(ctx, sqlite3_column_value(cur->snapshot_stmt, iCol + CLEARPRISM_COL_OFFSET));
+        else
+            sqlite3_result_null(ctx);
+        return SQLITE_OK;
+    }
+
     /* Cache serving path — zero-copy via SQLITE_STATIC */
     if (cur->serving_from_cache && cur->cache_cursor) {
         sqlite3_value *val = clearprism_cache_cursor_value(cur->cache_cursor, iCol);
@@ -1572,6 +1977,11 @@ int clearprism_vtab_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx,
 int clearprism_vtab_rowid(sqlite3_vtab_cursor *pCur, sqlite3_int64 *pRowid)
 {
     clearprism_cursor *cur = (clearprism_cursor *)pCur;
+
+    if (cur->serving_from_snapshot && cur->snapshot_stmt) {
+        *pRowid = sqlite3_column_int64(cur->snapshot_stmt, 0);
+        return SQLITE_OK;
+    }
 
     if (cur->serving_from_drain && cur->drain_rows) {
         int idx = cur->drain_idx;
