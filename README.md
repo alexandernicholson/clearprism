@@ -2,6 +2,30 @@
 
 A SQLite extension that federates read-only queries across multiple SQLite databases sharing the same schema. Query 100+ databases as if they were a single table — via a virtual table for SQL convenience, or a streaming C API for maximum throughput.
 
+```mermaid
+graph LR
+    subgraph WITHOUT["Without Clearprism"]
+        direction TB
+        A1["Your Code"] -->|"open db1"| D1["customers_east.db"]
+        A1 -->|"open db2"| D2["customers_west.db"]
+        A1 -->|"open db3"| D3["customers_north.db"]
+        A1 -->|"open ..."| D4["customers_south.db"]
+        A1 -.->|"manual loop, merge,<br>dedup, error handling"| A1
+    end
+
+    subgraph WITH["With Clearprism"]
+        direction TB
+        A2["Your Code"] -->|"one query"| CP["Clearprism"]
+        CP -->|"auto"| S1["customers_east.db"]
+        CP -->|"auto"| S2["customers_west.db"]
+        CP -->|"auto"| S3["customers_north.db"]
+        CP -->|"auto"| S4["customers_south.db"]
+    end
+
+    style WITHOUT fill:#2d2d2d,stroke:#666,color:#ccc
+    style WITH fill:#1a3a1a,stroke:#4a4,color:#ccc
+```
+
 ```sql
 -- Load the extension
 .load ./clearprism
