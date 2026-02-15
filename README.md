@@ -30,15 +30,14 @@ graph LR
 
 ### Why Clearprism?
 
-Benchmarked against manually federating 100 SQLite databases (100M rows total):
+Benchmarked against manually querying 100 SQLite databases (100M rows total):
 
-| Scenario | Manual Federation | Clearprism | Speedup |
-|----------|-------------------|------------|---------|
-| Point lookup (1 row from 100 DBs) | 29ms | **58us** (cached) | **500x** |
-| Filtered query (~1% selectivity) | 79s sequential | **519ms** (cached) | **153x** |
-| Full scan (100M rows) | 46s sequential | **23s** (parallel) | **2x** |
-| Repeated query (10 sources, warm) | 1.06ms | **55us** (cached) | **19x** |
-| Concurrent readers (16 threads) | manual locking | **6M rows/s** | scales linearly |
+| Scenario | Do It Yourself | Clearprism | Speedup |
+|----------|----------------|------------|---------|
+| Point lookup across 100 DBs | 29.9ms | **58us** | **515x faster** |
+| Filtered scan (~1% selectivity) | 81.5s | **567ms** | **144x faster** |
+| Full table scan (100M rows) | 47s | **23.5s** | **2x faster** |
+| Concurrent reads (16 threads) | you build it | **6M rows/s** | built-in |
 
 ```sql
 -- Load the extension

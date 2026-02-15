@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sqlite3.h>
 #include "clearprism.h"
@@ -1134,11 +1135,26 @@ static void bench_scenario_federation(void)
            (bench_now_us() - gen_t0) / 1e6);
     fflush(stdout);
 
-    /* Copy template to all source paths */
-    for (int i = 0; i < n_dbs; i++) {
-        char cp_cmd[600];
-        snprintf(cp_cmd, sizeof(cp_cmd), "cp '%s' '%s'", template_path, paths[i]);
-        (void)system(cp_cmd);
+    /* Copy template to all source paths using read/write (no fork overhead) */
+    {
+        int tfd = open(template_path, O_RDONLY);
+        if (tfd >= 0) {
+            struct stat st;
+            fstat(tfd, &st);
+            char *buf = malloc(st.st_size);
+            if (buf) {
+                ssize_t n = read(tfd, buf, st.st_size);
+                for (int i = 0; i < n_dbs; i++) {
+                    int dfd = open(paths[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (dfd >= 0) {
+                        (void)write(dfd, buf, n);
+                        close(dfd);
+                    }
+                }
+                free(buf);
+            }
+            close(tfd);
+        }
     }
     unlink(template_path);
 
