@@ -74,6 +74,94 @@ static int parse_kv(const char *arg, char **key, char **value)
     return 1;
 }
 
+/*
+ * Parse and validate a positive integer parameter. Returns 1 on success, 0 on error.
+ */
+static int parse_positive_int64(const char *value, const char *param_name,
+                                 int64_t *out, char **pzErr)
+{
+    char *end = NULL;
+    long long v = strtoll(value, &end, 10);
+    if (end == value || *end != '\0' || v <= 0) {
+        *pzErr = clearprism_mprintf(
+            "clearprism: '%s' must be a positive integer, got '%s'", param_name, value);
+        return 0;
+    }
+    *out = (int64_t)v;
+    return 1;
+}
+
+static int parse_positive_int(const char *value, const char *param_name,
+                               int *out, char **pzErr)
+{
+    int64_t v;
+    if (!parse_positive_int64(value, param_name, &v, pzErr)) return 0;
+    *out = (int)v;
+    return 1;
+}
+
+/*
+ * Parse a schema override string like "id INTEGER, name TEXT, email TEXT"
+ * into vtab->cols / vtab->nCol.
+ */
+static int vtab_parse_schema_override(clearprism_vtab *vtab, const char *schema, char **pzErr)
+{
+    /* Count commas to estimate column count */
+    int col_capacity = 8;
+    vtab->cols = sqlite3_malloc(col_capacity * (int)sizeof(*vtab->cols));
+    if (!vtab->cols) { *pzErr = clearprism_strdup("clearprism: out of memory"); return SQLITE_NOMEM; }
+    vtab->nCol = 0;
+
+    const char *p = schema;
+    while (*p) {
+        /* Skip whitespace */
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        /* Read column name */
+        const char *name_start = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != ',') p++;
+        size_t name_len = (size_t)(p - name_start);
+        if (name_len == 0) break;
+
+        /* Skip whitespace between name and type */
+        while (*p == ' ' || *p == '\t') p++;
+
+        /* Read type (everything until comma or end) */
+        const char *type_start = p;
+        while (*p && *p != ',') p++;
+        size_t type_len = (size_t)(p - type_start);
+        /* Trim trailing whitespace from type */
+        while (type_len > 0 && (type_start[type_len - 1] == ' ' || type_start[type_len - 1] == '\t'))
+            type_len--;
+
+        if (*p == ',') p++; /* skip comma */
+
+        /* Grow array if needed */
+        if (vtab->nCol >= col_capacity) {
+            col_capacity *= 2;
+            vtab->cols = sqlite3_realloc(vtab->cols, col_capacity * (int)sizeof(*vtab->cols));
+        }
+
+        clearprism_col_def *col = &vtab->cols[vtab->nCol];
+        col->name = sqlite3_malloc((int)(name_len + 1));
+        memcpy(col->name, name_start, name_len);
+        col->name[name_len] = '\0';
+        col->type = sqlite3_malloc((int)(type_len + 1));
+        memcpy(col->type, type_start, type_len);
+        col->type[type_len] = '\0';
+        col->notnull = 0;
+        col->pk = (vtab->nCol == 0) ? 1 : 0; /* first column is PK by convention */
+        vtab->nCol++;
+    }
+
+    if (vtab->nCol == 0) {
+        *pzErr = clearprism_strdup("clearprism: schema override has no columns");
+        return SQLITE_ERROR;
+    }
+    return SQLITE_OK;
+}
+
 static int vtab_parse_args(int argc, const char *const *argv,
                             clearprism_vtab *vtab, char **pzErr)
 {
@@ -103,20 +191,42 @@ static int vtab_parse_args(int argc, const char *const *argv,
         } else if (strcmp(key, "cache_db") == 0) {
             vtab->cache_db_path = value;
             value = NULL;
+        } else if (strcmp(key, "schema") == 0) {
+            vtab->schema_override = value;
+            value = NULL;
         } else if (strcmp(key, "l1_max_rows") == 0) {
-            vtab->l1_max_rows = atoll(value);
+            int64_t v;
+            if (!parse_positive_int64(value, "l1_max_rows", &v, pzErr)) {
+                sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
+            }
+            vtab->l1_max_rows = v;
         } else if (strcmp(key, "l1_max_bytes") == 0) {
-            vtab->l1_max_bytes = atoll(value);
+            int64_t v;
+            if (!parse_positive_int64(value, "l1_max_bytes", &v, pzErr)) {
+                sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
+            }
+            vtab->l1_max_bytes = v;
             user_set_max_bytes = 1;
         } else if (strcmp(key, "pool_max_open") == 0) {
-            vtab->pool_max_open = atoi(value);
+            if (!parse_positive_int(value, "pool_max_open", &vtab->pool_max_open, pzErr)) {
+                sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
+            }
         } else if (strcmp(key, "l2_refresh_sec") == 0) {
-            vtab->l2_refresh_interval_sec = atoi(value);
+            if (!parse_positive_int(value, "l2_refresh_sec", &vtab->l2_refresh_interval_sec, pzErr)) {
+                sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
+            }
         } else if (strcmp(key, "mode") == 0) {
-            if (strcmp(value, "snapshot") == 0)
+            if (strcmp(value, "snapshot") == 0) {
                 vtab->snapshot_mode = 1;
+            } else if (strcmp(value, "live") != 0) {
+                *pzErr = clearprism_mprintf(
+                    "clearprism: invalid mode '%s' (expected 'live' or 'snapshot')", value);
+                sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
+            }
+        } else {
+            *pzErr = clearprism_mprintf("clearprism: unknown parameter '%s'", key);
+            sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
         }
-        /* else: unknown key, silently ignore */
 
         sqlite3_free(key);
         sqlite3_free(value);
@@ -228,7 +338,18 @@ static int vtab_discover_schema(clearprism_vtab *vtab, char **pzErr)
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
         if (rc2 != SQLITE_OK) {
             sqlite3_close(check_db);
-            continue;  /* source unavailable — skip validation */
+            /* Pre-flight warning: source unreachable */
+            char *w = clearprism_mprintf("source '%s' (alias '%s') unreachable; ",
+                                          sources[s].path, sources[s].alias);
+            if (vtab->init_warnings) {
+                char *combined = clearprism_mprintf("%s%s", vtab->init_warnings, w);
+                sqlite3_free(vtab->init_warnings);
+                sqlite3_free(w);
+                vtab->init_warnings = combined;
+            } else {
+                vtab->init_warnings = w;
+            }
+            continue;
         }
 
         char *check_sql = clearprism_mprintf("PRAGMA table_info(\"%s\")",
@@ -286,8 +407,9 @@ static int vtab_discover_schema(clearprism_vtab *vtab, char **pzErr)
             pos += snprintf(sql + pos, sql_size - pos, " %s", vtab->cols[i].type);
         }
     }
-    /* Add hidden _source_db column */
-    pos += snprintf(sql + pos, sql_size - pos, ", _source_db TEXT HIDDEN)");
+    /* Add hidden columns */
+    pos += snprintf(sql + pos, sql_size - pos,
+                    ", _source_db TEXT HIDDEN, _source_errors INTEGER HIDDEN)");
     vtab->create_table_sql = sql;
 
     return SQLITE_OK;
@@ -321,9 +443,21 @@ static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr)
                                     vtab->l2_refresh_interval_sec,
                                     vtab->registry, vtab->pool, &l2_err);
         if (!l2) {
-            /* L2 failure is non-fatal — log and continue without it */
+            /* L2 failure is non-fatal — warn and continue without it */
+            char *w = clearprism_mprintf("L2 cache failed to initialize: %s; ",
+                                          l2_err ? l2_err : "unknown error");
+            sqlite3_log(SQLITE_WARNING, "clearprism: %s", w);
+            if (vtab->init_warnings) {
+                char *combined = clearprism_mprintf("%s%s", vtab->init_warnings, w);
+                sqlite3_free(vtab->init_warnings);
+                sqlite3_free(w);
+                vtab->init_warnings = combined;
+            } else {
+                vtab->init_warnings = w;
+            }
             sqlite3_free(l2_err);
         } else {
+            vtab->l2_active = 1;
             /* Start background refresh thread */
             char *start_err = NULL;
             clearprism_l2_start_refresh(l2, &start_err);
@@ -366,11 +500,28 @@ static int vtab_init(sqlite3 *db, int argc, const char *const *argv,
         return SQLITE_ERROR;
     }
 
-    /* Discover schema from first source */
-    rc = vtab_discover_schema(vtab, pzErr);
-    if (rc != SQLITE_OK) {
-        vtab_free(vtab);
-        return rc;
+    /* Discover schema — from override or first source */
+    if (vtab->schema_override) {
+        rc = vtab_parse_schema_override(vtab, vtab->schema_override, pzErr);
+        if (rc != SQLITE_OK) { vtab_free(vtab); return rc; }
+        /* Build CREATE TABLE SQL */
+        size_t sql_size = 256;
+        for (int i = 0; i < vtab->nCol; i++)
+            sql_size += strlen(vtab->cols[i].name) + strlen(vtab->cols[i].type) + 32;
+        char *sql = sqlite3_malloc((int)sql_size);
+        int pos = snprintf(sql, sql_size, "CREATE TABLE x(");
+        for (int i = 0; i < vtab->nCol; i++) {
+            if (i > 0) pos += snprintf(sql + pos, sql_size - pos, ", ");
+            pos += snprintf(sql + pos, sql_size - pos, "\"%s\"", vtab->cols[i].name);
+            if (vtab->cols[i].type[0])
+                pos += snprintf(sql + pos, sql_size - pos, " %s", vtab->cols[i].type);
+        }
+        pos += snprintf(sql + pos, sql_size - pos,
+                        ", _source_db TEXT HIDDEN, _source_errors INTEGER HIDDEN)");
+        vtab->create_table_sql = sql;
+    } else {
+        rc = vtab_discover_schema(vtab, pzErr);
+        if (rc != SQLITE_OK) { vtab_free(vtab); return rc; }
     }
 
     /* Declare the virtual table schema */
@@ -405,6 +556,12 @@ static int vtab_init(sqlite3 *db, int argc, const char *const *argv,
                 return rc;
             }
         }
+    }
+
+    /* Log creation warnings (if any) */
+    if (vtab->init_warnings) {
+        sqlite3_log(SQLITE_WARNING, "clearprism [%s]: %s",
+                    vtab->target_table, vtab->init_warnings);
     }
 
     /* Register vtab in global map for aggregate function lookup */
@@ -448,6 +605,8 @@ static void vtab_free(clearprism_vtab *vtab)
     sqlite3_free(vtab->cache_db_path);
     sqlite3_free(vtab->create_table_sql);
     sqlite3_free(vtab->snapshot_table);
+    sqlite3_free(vtab->init_warnings);
+    sqlite3_free(vtab->schema_override);
 
     if (vtab->cols) {
         for (int i = 0; i < vtab->nCol; i++) {

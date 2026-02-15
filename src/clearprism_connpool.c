@@ -93,6 +93,8 @@ sqlite3 *clearprism_connpool_checkout(clearprism_connpool *pool,
         entry->last_used = time(NULL);
         pool_lru_remove(pool, entry);
         pool_lru_push_front(pool, entry);
+        pool->total_checkouts++;
+        pool->current_checked_out++;
         sqlite3 *conn = entry->conn;
         pthread_mutex_unlock(&pool->lock);
         return conn;
@@ -167,6 +169,8 @@ sqlite3 *clearprism_connpool_checkout(clearprism_connpool *pool,
     pool->n_open++;
 
     pool_lru_push_front(pool, entry);
+    pool->total_checkouts++;
+    pool->current_checked_out++;
 
     sqlite3 *conn = entry->conn;
     pthread_mutex_unlock(&pool->lock);
@@ -183,6 +187,7 @@ void clearprism_connpool_checkin(clearprism_connpool *pool, const char *db_path)
     clearprism_pool_entry *entry = pool_find(pool, db_path, hash);
     if (entry && entry->checkout_count > 0) {
         entry->checkout_count--;
+        pool->current_checked_out--;
         entry->last_used = time(NULL);
         if (entry->checkout_count == 0) {
             /* Signal waiters that a connection is available for eviction */
@@ -257,4 +262,18 @@ static int pool_evict_one(clearprism_connpool *pool)
         e = e->lru_prev;
     }
     return 0;  /* No idle connections to evict */
+}
+
+void clearprism_connpool_stats(clearprism_connpool *pool,
+                                int *out_open, int *out_max,
+                                int *out_checked_out,
+                                int64_t *out_total_checkouts)
+{
+    if (!pool) return;
+    pthread_mutex_lock(&pool->lock);
+    if (out_open) *out_open = pool->n_open;
+    if (out_max) *out_max = pool->max_open;
+    if (out_checked_out) *out_checked_out = pool->current_checked_out;
+    if (out_total_checkouts) *out_total_checkouts = pool->total_checkouts;
+    pthread_mutex_unlock(&pool->lock);
 }

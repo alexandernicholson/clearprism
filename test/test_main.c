@@ -15,6 +15,7 @@ extern int test_cache_run(void);
 extern int test_vtab_run(void);
 extern int test_agg_run(void);
 extern int test_scanner_run(void);
+extern int test_admin_run(void);
 
 /* Simple test framework */
 static int total_tests = 0;
@@ -62,6 +63,10 @@ int main(int argc, char **argv)
 
     printf("[Scanner API Tests]\n");
     test_scanner_run();
+    printf("\n");
+
+    printf("[Admin Function Tests]\n");
+    test_admin_run();
     printf("\n");
 
     printf("=== Results: %d/%d passed", passed_tests, total_tests);

@@ -54,7 +54,12 @@ Expected output:
   PASS: column_accessors
   ...
 
-=== Results: 232/232 passed ===
+[Admin Function Tests]
+  PASS: admin_init_registry
+  PASS: admin_status
+  ...
+
+=== Results: 268/268 passed ===
 ```
 
 ## Test Structure
@@ -70,6 +75,7 @@ All tests are in the `test/` directory:
 | `test_vtab.c` | End-to-end virtual table | Basic SELECT across 3 sources, `_source_db` filter, WHERE pushdown (LIKE, EQ, NE, GLOB, IS NULL, IS NOT NULL, IN), empty results, cache_db mode, composite rowids (stable + lookup), L1 cache population, OFFSET, ORDER BY (single/multi-source), combined queries, registry auto-reload, parallel drain, snapshot mode (basic, WHERE, source_db, rowid, limit/offset, ORDER BY, L1 cache, destroy) |
 | `test_agg.c` | Aggregate pushdown | COUNT, SUM, MIN, MAX, AVG, GROUP BY pushdown |
 | `test_scanner.c` | Scanner API | Full scan, column accessors, source alias/id, column metadata, WHERE filter/range, callback iteration, early stop, empty sources, single source, NULL handling |
+| `test_admin.c` | Admin functions & UX | Registry init, status JSON, cache flush, add source, reload registry, parameter validation, `_source_errors` column, schema override, cache hit/miss counters |
 
 ## Test Framework
 
@@ -195,6 +201,20 @@ users: (20, 'Frank', 'frank@north.com')
 | `test_scanner_source_id` | `scan_source_id()` returns numeric source IDs from the registry |
 
 The scanner tests create a fresh registry + source databases in `/tmp` with a schema of `items (id INTEGER PRIMARY KEY, category TEXT, name TEXT, value REAL)`.
+
+### Admin Function Tests
+
+| Test | Validates |
+|------|-----------|
+| `test_admin_init_registry` | Creates registry tables, verifies they exist, tests idempotency |
+| `test_admin_status` | Creates vtab, queries `clearprism_status()`, verifies JSON structure and content |
+| `test_admin_flush_cache` | Runs query to populate L1, flushes, verifies entries zeroed in status |
+| `test_admin_add_source` | Adds source to registry, verifies row exists, tests duplicate rejection |
+| `test_admin_reload_registry` | Tests reload returns ok, error for unknown vtab name |
+| `test_admin_param_validation` | Tests `pool_max_open=abc`, `mode=invalid`, unknown param, negative `l1_max_rows` all rejected; `mode=live` accepted |
+| `test_admin_source_errors_column` | Queries `_source_errors` column, verifies 0 with healthy sources |
+| `test_admin_schema_override` | Creates vtab with `schema='id INTEGER, name TEXT, price REAL'`, verifies queries work |
+| `test_admin_cache_hit_miss` | Runs query twice, verifies misses after first, hits after second via status JSON |
 
 ## Writing New Tests
 

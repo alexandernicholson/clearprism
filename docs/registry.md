@@ -90,7 +90,13 @@ Each scan gets its own snapshot, so changes to the registry take effect on the n
 
 ### Adding a new source
 
+You can add sources via SQL or the built-in helper function:
+
 ```sql
+-- Option A: Use the admin function (after loading the extension)
+SELECT clearprism_add_source('my_vtab', '/data/new_region.db', 'new_region');
+
+-- Option B: Direct SQL on the registry database
 INSERT INTO clearprism_sources (path, alias, priority)
 VALUES ('/data/new_region.db', 'new_region', 10);
 ```
@@ -126,11 +132,28 @@ PRAGMA table_info("{table_name}");
 
 This determines the column names, types, NOT NULL constraints, and primary keys. The discovered schema is used for all source databases — they must match.
 
-The virtual table is then declared to SQLite with the discovered columns plus the hidden `_source_db` column:
+If any sources are unreachable during schema discovery, they are logged as warnings (visible via `clearprism_status()`) but do not prevent creation — the schema is discovered from the first available source.
+
+Alternatively, if the `schema` parameter is provided, auto-discovery is skipped entirely and the user-supplied column definitions are used.
+
+The virtual table is then declared to SQLite with the discovered columns plus two hidden columns:
 
 ```sql
-CREATE TABLE x("id" INTEGER, "name" TEXT, "email" TEXT, _source_db TEXT HIDDEN);
+CREATE TABLE x("id" INTEGER, "name" TEXT, "email" TEXT, _source_db TEXT HIDDEN, _source_errors INTEGER HIDDEN);
 ```
+
+The `_source_errors` column reports the number of sources that failed during query preparation.
+
+## Creating a Registry
+
+You can create a registry database manually or use the built-in helper:
+
+```sql
+-- After loading the extension
+SELECT clearprism_init_registry('/path/to/registry.db');
+```
+
+This creates both the `clearprism_sources` and `clearprism_table_overrides` tables using `CREATE TABLE IF NOT EXISTS`. It is safe to run on an existing registry.
 
 ## Best Practices
 

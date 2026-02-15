@@ -1681,6 +1681,12 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
         }
     }
 
+    /* Count errored source handles */
+    cur->n_source_errors = 0;
+    for (int i = 0; i < cur->n_handles; i++) {
+        if (cur->handles[i].errored) cur->n_source_errors++;
+    }
+
     /* Early buffer skip: predict uncacheable queries to avoid wasted
      * sqlite3_value_dup work.  Setting buffer_overflow = 1 here means
      * cursor_buffer_current_row() will short-circuit on the very first
@@ -1931,6 +1937,12 @@ int clearprism_vtab_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx,
 {
     clearprism_cursor *cur = (clearprism_cursor *)pCur;
     clearprism_vtab *vtab = cur->vtab;
+
+    /* Hidden _source_errors column — always available */
+    if (iCol == vtab->nCol + 1) {
+        sqlite3_result_int(ctx, cur->n_source_errors);
+        return SQLITE_OK;
+    }
 
     /* Drain serving path — zero-copy via SQLITE_STATIC */
     if (cur->serving_from_drain && cur->drain_values) {

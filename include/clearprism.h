@@ -138,6 +138,9 @@ struct clearprism_connpool {
     /* LRU list (head = most recently used, tail = least recently used) */
     clearprism_pool_entry *lru_head;
     clearprism_pool_entry *lru_tail;
+    /* Lifetime stats */
+    int64_t  total_checkouts;
+    int      current_checked_out;
     pthread_mutex_t lock;
     pthread_cond_t  cond;   /* signaled when a connection is checked in */
 };
@@ -179,6 +182,9 @@ struct clearprism_l1_cache {
     /* LRU list */
     clearprism_l1_entry *lru_head;
     clearprism_l1_entry *lru_tail;
+    /* Lifetime stats */
+    int64_t  hits;
+    int64_t  misses;
     pthread_mutex_t lock;
 };
 
@@ -290,6 +296,11 @@ struct clearprism_vtab {
     /* Snapshot mode */
     int   snapshot_mode;      /* 1 if mode='snapshot' */
     char *snapshot_table;     /* "_clearprism_snap_{vtab_name}" */
+
+    /* UX: creation warnings, L2 status, schema override */
+    char *init_warnings;      /* warnings collected during vtab creation */
+    int   l2_active;          /* 1 if L2 cache initialized successfully */
+    char *schema_override;    /* user-supplied schema string (if any) */
 };
 
 /* ---------- Cursor ---------- */
@@ -373,6 +384,9 @@ struct clearprism_cursor {
     int                drain_n_cols;
     int                drain_idx;        /* current serving position */
     int                serving_from_drain;
+
+    /* Source error tracking */
+    int                n_source_errors;  /* count of errored sources this query */
 };
 
 /* ========== Public API Functions ========== */
@@ -412,6 +426,10 @@ sqlite3 *clearprism_connpool_checkout(clearprism_connpool *pool,
                                        char **errmsg);
 void     clearprism_connpool_checkin(clearprism_connpool *pool,
                                       const char *db_path);
+void     clearprism_connpool_stats(clearprism_connpool *pool,
+                                    int *out_open, int *out_max,
+                                    int *out_checked_out,
+                                    int64_t *out_total_checkouts);
 
 /* clearprism_where.c */
 char    *clearprism_where_encode(sqlite3_index_info *info, int nCol, int *out_flags);
@@ -459,6 +477,7 @@ int  clearprism_l1_insert(clearprism_l1_cache *l1, const char *key,
                            int n_rows, int n_values_per_row,
                            size_t byte_size);
 void clearprism_l1_evict_expired(clearprism_l1_cache *l1);
+void clearprism_l1_flush(clearprism_l1_cache *l1);
 
 /* clearprism_cache_l2.c */
 clearprism_l2_cache *clearprism_l2_create(const char *cache_db_path,
@@ -506,6 +525,9 @@ void clearprism_work_pool_run(clearprism_work_pool *pool,
 
 /* clearprism_agg.c — Aggregate pushdown functions */
 int clearprism_register_agg_functions(sqlite3 *db);
+
+/* clearprism_admin.c — Admin/diagnostic SQL functions */
+int clearprism_register_admin_functions(sqlite3 *db);
 
 /* Per-connection vtab registry for aggregate function lookup */
 void clearprism_register_vtab(const char *table, clearprism_vtab *vtab);

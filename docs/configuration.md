@@ -97,6 +97,58 @@ Interval in seconds between L2 shadow table refreshes. The background refresh th
 
 Lower values keep the shadow table more current but increase I/O load on source databases. Set to a very large value (e.g., `86400`) if you only want L2 populated once at startup.
 
+### schema (optional)
+
+Manual column definition that bypasses automatic schema discovery from source databases. Useful when source databases are unavailable at creation time, or when you want to define the schema explicitly.
+
+| | |
+|---|---|
+| **Default** | — (auto-discover from first source) |
+| **Type** | String |
+
+The value is a comma-separated list of column definitions in `name TYPE` format:
+
+```sql
+CREATE VIRTUAL TABLE t USING clearprism(
+    registry_db='registry.db',
+    table='users',
+    schema='id INTEGER, name TEXT, email TEXT, age INTEGER'
+);
+```
+
+When `schema` is set, Clearprism skips opening any source database for schema discovery. The hidden `_source_db` and `_source_errors` columns are still appended automatically.
+
+## Parameter Validation
+
+All parameters are validated at `CREATE VIRTUAL TABLE` time. Invalid configuration is rejected with a descriptive error message instead of silently using defaults.
+
+**Integer parameters** (`l1_max_rows`, `l1_max_bytes`, `pool_max_open`, `l2_refresh_sec`) must be positive integers. Non-numeric values, negative numbers, and zero are rejected:
+
+```sql
+-- Error: clearprism: invalid value for 'pool_max_open': 'abc' (must be a positive integer)
+CREATE VIRTUAL TABLE t USING clearprism(
+    registry_db='r.db', table='t', pool_max_open='abc'
+);
+```
+
+**Mode** must be exactly `live` or `snapshot`:
+
+```sql
+-- Error: clearprism: invalid mode 'fast' (must be 'live' or 'snapshot')
+CREATE VIRTUAL TABLE t USING clearprism(
+    registry_db='r.db', table='t', mode='fast'
+);
+```
+
+**Unknown parameters** are rejected:
+
+```sql
+-- Error: clearprism: unknown parameter 'timeout'
+CREATE VIRTUAL TABLE t USING clearprism(
+    registry_db='r.db', table='t', timeout=5000
+);
+```
+
 ## Example: Full Configuration
 
 ```sql
@@ -107,7 +159,8 @@ CREATE VIRTUAL TABLE all_events USING clearprism(
     l1_max_rows=50000,
     l1_max_bytes=134217728,
     pool_max_open=64,
-    l2_refresh_sec=120
+    l2_refresh_sec=120,
+    schema='id INTEGER, timestamp TEXT, type TEXT, payload TEXT'
 );
 ```
 

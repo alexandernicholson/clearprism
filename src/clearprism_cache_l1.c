@@ -82,18 +82,21 @@ clearprism_l1_entry *clearprism_l1_lookup(clearprism_l1_cache *l1, const char *k
                 /* Expired — remove and return miss */
                 l1_remove_entry(l1, e);
                 l1_entry_free(e);
+                l1->misses++;
                 pthread_mutex_unlock(&l1->lock);
                 return NULL;
             }
             /* Move to front of LRU */
             l1_lru_remove(l1, e);
             l1_lru_push_front(l1, e);
+            l1->hits++;
             pthread_mutex_unlock(&l1->lock);
             return e;
         }
         e = e->hash_next;
     }
 
+    l1->misses++;
     pthread_mutex_unlock(&l1->lock);
     return NULL;
 }
@@ -255,4 +258,27 @@ static void l1_evict_lru(clearprism_l1_cache *l1)
     if (!victim) return;
     l1_remove_entry(l1, victim);
     l1_entry_free(victim);
+}
+
+void clearprism_l1_flush(clearprism_l1_cache *l1)
+{
+    if (!l1) return;
+
+    pthread_mutex_lock(&l1->lock);
+    for (int i = 0; i < l1->n_buckets; i++) {
+        clearprism_l1_entry *e = l1->buckets[i];
+        while (e) {
+            clearprism_l1_entry *next = e->hash_next;
+            l1_entry_free(e);
+            e = next;
+        }
+        l1->buckets[i] = NULL;
+    }
+    l1->n_entries = 0;
+    l1->total_rows = 0;
+    l1->total_bytes = 0;
+    l1->lru_head = NULL;
+    l1->lru_tail = NULL;
+    /* Keep lifetime hits/misses counters */
+    pthread_mutex_unlock(&l1->lock);
 }

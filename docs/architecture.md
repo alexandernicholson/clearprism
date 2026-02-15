@@ -20,12 +20,13 @@ graph LR
 
 The extension registers a module named `"clearprism"` via `sqlite3_create_module()`. When a user executes `CREATE VIRTUAL TABLE ... USING clearprism(...)`, SQLite calls the module's `xCreate` callback, which:
 
-1. Parses the key=value arguments
+1. Parses and validates the key=value arguments (rejects unknown params, invalid integers, bad mode values)
 2. Opens the registry database and loads the source list
-3. Introspects the schema from the first active source via `PRAGMA table_info`
-4. Declares the virtual table schema to SQLite (with `_source_db TEXT HIDDEN` appended)
-5. Initializes the connection pool, L1 cache, and optionally L2 cache
-6. If `mode='snapshot'`, populates the snapshot shadow table (see [Snapshot Mode](#snapshot-mode))
+3. Introspects the schema from the first active source via `PRAGMA table_info` (or uses the `schema` override if provided)
+4. Declares the virtual table schema to SQLite (with `_source_db TEXT HIDDEN` and `_source_errors INTEGER HIDDEN` appended)
+5. Initializes the connection pool, L1 cache, and optionally L2 cache (L2 failures are non-fatal — logged as warnings)
+6. Logs any initialization warnings (unreachable sources, L2 failures)
+7. If `mode='snapshot'`, populates the snapshot shadow table (see [Snapshot Mode](#snapshot-mode))
 
 ## Module Registration
 
@@ -198,6 +199,8 @@ For real columns: returns the value from the current `sqlite3_stmt` or cache cur
 
 For the hidden `_source_db` column (index `nCol`): returns the alias of the current source database.
 
+For the hidden `_source_errors` column (index `nCol + 1`): returns the count of source databases that failed during query preparation (connection errors, missing tables, etc.). This is always 0 when all sources are healthy.
+
 **Cache serving path**: When `serving_from_cache` is set, xColumn uses type-specific `sqlite3_result_*` functions with `SQLITE_STATIC` for text/blob values instead of `sqlite3_result_value()`. This avoids a deep copy per column per row — the cached `sqlite3_value` objects are stable for the duration of the query, making `SQLITE_STATIC` safe. This zero-copy approach is critical for cache serving performance.
 
 ### Parallel Source Preparation
@@ -359,11 +362,14 @@ Clearprism is designed to be resilient:
 
 | Failure | Behavior |
 |---------|----------|
-| Source database unavailable | Logged, skipped — remaining sources still queried |
+| Source database unavailable | Logged, skipped — remaining sources still queried; count visible via `_source_errors` column |
+| Source unavailable at creation | Warning appended to `init_warnings`, logged via `sqlite3_log(SQLITE_WARNING, ...)` |
 | Registry database unavailable | `xFilter` returns `SQLITE_ERROR` with descriptive message |
 | Connection pool exhausted | Waits up to `timeout_ms` (default 5s), then returns `SQLITE_BUSY` |
 | L2 refresh failure | Logged, retried next interval — L1 and live queries unaffected |
-| L2 creation failure | Non-fatal — extension continues without disk cache |
+| L2 creation failure | Non-fatal — warning logged, `l2_active` set to 0, extension continues without disk cache |
+| Invalid parameter value | `CREATE VIRTUAL TABLE` returns `SQLITE_ERROR` with descriptive message (e.g., "invalid value for 'pool_max_open'") |
+| Unknown parameter | `CREATE VIRTUAL TABLE` returns `SQLITE_ERROR` (e.g., "unknown parameter 'timeout'") |
 
 ## Memory Management
 
@@ -440,3 +446,17 @@ Scenarios: `baseline`, `source_scale`, `cache`, `where`, `orderby`, `row_scale`,
 The `federation` scenario compares direct SQLite, virtual table, and scanner API on a full scan of 100 sources × 1M rows.
 
 The `snapshot` scenario compares snapshot population approaches (direct-open with type-specific binds vs scanner API) at multiple scales (10×1K, 10×10K, 100×1K rows).
+
+## Admin & Diagnostics
+
+The extension registers five SQL scalar functions (`clearprism_admin.c`) for runtime introspection and management. These are registered by both the extension entry point (`sqlite3_clearprism_init`) and the core entry point (`clearprism_init`).
+
+| Function | Purpose |
+|----------|---------|
+| `clearprism_status(vtab_name)` | Returns JSON with L1 cache stats (entries, rows, bytes, hits, misses), pool stats (open, max, checked_out, total_checkouts), registry info, L2 status, and warnings |
+| `clearprism_init_registry(path)` | Creates the `clearprism_sources` and `clearprism_table_overrides` tables |
+| `clearprism_add_source(vtab, path, alias)` | Inserts a source into the vtab's registry |
+| `clearprism_flush_cache(vtab_name)` | Clears L1 cache (preserves lifetime hit/miss counters) |
+| `clearprism_reload_registry(vtab_name)` | Forces immediate registry re-read |
+
+Admin functions use `clearprism_lookup_vtab()` to find live vtab instances by name from a global registry. The L1 cache tracks hit/miss counters (incremented under the existing lock), and the connection pool tracks checkout/checkin counts for pool utilization monitoring.

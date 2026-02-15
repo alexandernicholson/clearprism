@@ -74,6 +74,7 @@ SELECT * FROM all_users WHERE email LIKE '%@example.com';
 
 - **Federated queries** across 100+ SQLite databases with identical schemas
 - **Hidden `_source_db` column** on every row identifying which database it came from
+- **Hidden `_source_errors` column** reports how many sources failed during a query
 - **WHERE pushdown** sends constraints (EQ, GT, GE, LT, LE, LIKE, NE, GLOB, IS NULL, IS NOT NULL, REGEXP, MATCH, IN) to each source database
 - **LIMIT/OFFSET pushdown** stops scanning after the requested rows, skips offset rows
 - **ORDER BY pushdown** for single-source queries (when `_source_db` is constrained)
@@ -86,6 +87,9 @@ SELECT * FROM all_users WHERE email LIKE '%@example.com';
 - **Resilient** — skips unavailable sources instead of failing the entire query
 - **Thread-safe** with per-component locking and a strict lock hierarchy
 - **Snapshot mode** materializes all source data into a local shadow table for fast repeated queries
+- **Schema override** bypasses auto-discovery with a user-supplied column definition
+- **Admin SQL functions** for runtime diagnostics, cache management, and registry setup
+- **Strict parameter validation** with clear error messages for invalid configuration
 
 ## Quick Start
 
@@ -114,6 +118,16 @@ This produces `clearprism.so` (Linux) or `clearprism.dylib` (macOS).
 **1. Create a registry database** listing your source databases:
 
 ```sql
+-- Option A: Use the built-in helper
+.load ./clearprism
+SELECT clearprism_init_registry('/path/to/registry.db');
+SELECT clearprism_add_source('unified_users', '/data/east.db', 'east');
+SELECT clearprism_add_source('unified_users', '/data/west.db', 'west');
+SELECT clearprism_add_source('unified_users', '/data/north.db', 'north');
+```
+
+```sql
+-- Option B: Create manually
 sqlite3 registry.db <<'SQL'
 CREATE TABLE clearprism_sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +172,9 @@ All parameters are passed as `key=value` pairs in the `CREATE VIRTUAL TABLE` sta
 | `l1_max_bytes` | No | `67108864` | Maximum bytes in L1 cache (64 MiB) |
 | `pool_max_open` | No | `32` | Maximum simultaneously open database connections |
 | `l2_refresh_sec` | No | `300` | L2 shadow table refresh interval in seconds |
+| `schema` | No | — | Manual column definition (e.g., `'id INTEGER, name TEXT'`), bypasses auto-discovery |
+
+All integer parameters are validated at creation time — non-numeric values, negative numbers, and zero are rejected with a descriptive error. Unknown parameters are also rejected. `mode` only accepts `live` or `snapshot`.
 
 ## Architecture Overview
 
@@ -208,7 +225,9 @@ clearprism/
 │   ├── clearprism_cache_l2.c   # Shadow table cache with background refresh
 │   ├── clearprism_where.c      # WHERE constraint encoding and SQL generation
 │   ├── clearprism_util.c       # Helpers (FNV-1a hash, string utils, error formatting)
-│   └── clearprism_scanner.c    # Streaming scanner API (zero-vtab-overhead iteration)
+│   ├── clearprism_scanner.c    # Streaming scanner API (zero-vtab-overhead iteration)
+│   ├── clearprism_agg.c        # Aggregate pushdown functions (COUNT, SUM, MIN, MAX, AVG)
+│   └── clearprism_admin.c      # Admin/diagnostic SQL functions
 ├── test/
 │   ├── test_main.c             # Test runner
 │   ├── test_registry.c         # Registry unit tests
@@ -216,7 +235,8 @@ clearprism/
 │   ├── test_cache.c            # L1 and unified cache tests
 │   ├── test_vtab.c             # End-to-end virtual table tests
 │   ├── test_agg.c              # Aggregate pushdown tests
-│   └── test_scanner.c          # Scanner API tests
+│   ├── test_scanner.c          # Scanner API tests
+│   └── test_admin.c            # Admin function and UX tests
 ├── CMakeLists.txt
 └── Makefile
 ```
@@ -241,6 +261,31 @@ clearprism_scan_close(sc);
 ```
 
 See the [API Reference](docs/api.md) for full scanner documentation.
+
+## Admin & Diagnostic Functions
+
+Clearprism registers SQL functions for runtime introspection and management:
+
+```sql
+-- View live stats (L1 cache, pool, registry, warnings)
+SELECT clearprism_status('my_vtab');
+
+-- Initialize a new registry database with the correct schema
+SELECT clearprism_init_registry('/path/to/registry.db');
+
+-- Add a source to an existing vtab's registry
+SELECT clearprism_add_source('my_vtab', '/data/new.db', 'new_region');
+
+-- Flush the L1 cache for a vtab
+SELECT clearprism_flush_cache('my_vtab');
+
+-- Force-reload the registry (pick up source changes immediately)
+SELECT clearprism_reload_registry('my_vtab');
+```
+
+`clearprism_status` returns a JSON object with L1 cache stats (entries, rows, bytes, hits, misses), connection pool stats (open, max, checked_out), registry info (source count, last reload), L2 status, and any initialization warnings.
+
+See the [API Reference](docs/api.md#admin-functions) for full documentation.
 
 ## License
 

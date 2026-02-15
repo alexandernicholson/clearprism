@@ -33,6 +33,9 @@ set(CLEARPRISM_SOURCES
     src/clearprism_cache.c
     src/clearprism_where.c
     src/clearprism_util.c
+    src/clearprism_agg.c
+    src/clearprism_scanner.c
+    src/clearprism_admin.c
 )
 
 # Shared library (loadable extension)
@@ -60,6 +63,9 @@ set(TEST_SOURCES
     test/test_cache.c
     test/test_connpool.c
     test/test_registry.c
+    test/test_agg.c
+    test/test_scanner.c
+    test/test_admin.c
 )
 
 add_executable(clearprism_tests

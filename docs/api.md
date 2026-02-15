@@ -465,6 +465,113 @@ Callback-driven iteration. Calls `callback` for each row. If the callback return
 
 **Returns**: `SQLITE_OK` if all rows were consumed, or the callback's non-zero return value.
 
+## Admin Functions
+
+Clearprism registers five SQL scalar functions for runtime diagnostics and management. These are available after loading the extension (or calling `clearprism_init`).
+
+### clearprism_status
+
+```sql
+SELECT clearprism_status('vtab_name');
+```
+
+Returns a JSON object with live statistics for the named virtual table:
+
+```json
+{
+  "l1_entries": 5,
+  "l1_rows": 150,
+  "l1_bytes": 4096,
+  "l1_max_rows": 10000,
+  "l1_max_bytes": 67108864,
+  "l1_hits": 42,
+  "l1_misses": 7,
+  "pool_open": 3,
+  "pool_max": 32,
+  "pool_checked_out": 0,
+  "pool_total_checkouts": 15,
+  "registry_sources": 10,
+  "registry_last_reload": 1700000000,
+  "l2_active": 1,
+  "warnings": ""
+}
+```
+
+**Returns**: JSON text on success, error if the vtab is not found.
+
+### clearprism_init_registry
+
+```sql
+SELECT clearprism_init_registry('/path/to/registry.db');
+```
+
+Creates a registry database at the given path with the correct schema (`clearprism_sources` and `clearprism_table_overrides` tables). Uses `CREATE TABLE IF NOT EXISTS`, so it is safe to call on an existing registry.
+
+**Returns**: `'ok'` on success, error on failure.
+
+### clearprism_add_source
+
+```sql
+SELECT clearprism_add_source('vtab_name', '/path/to/source.db', 'alias');
+```
+
+Adds a source database to the registry of the named virtual table. Opens the vtab's registry database, inserts the source with the given path and alias, and closes.
+
+**Returns**: `'ok'` on success, error on failure (e.g., duplicate alias, vtab not found).
+
+### clearprism_flush_cache
+
+```sql
+SELECT clearprism_flush_cache('vtab_name');
+```
+
+Flushes all entries from the L1 in-memory cache for the named virtual table. Lifetime hit/miss counters are preserved. Useful for forcing fresh reads from source databases.
+
+**Returns**: `'ok'` on success, error if the vtab is not found.
+
+### clearprism_reload_registry
+
+```sql
+SELECT clearprism_reload_registry('vtab_name');
+```
+
+Forces an immediate reload of the source list from the registry database. Normally the registry auto-reloads every 60 seconds — this function triggers it immediately.
+
+**Returns**: `'ok'` on success, error if the vtab is not found or reload fails.
+
+## L1 Cache Management
+
+### clearprism_l1_flush
+
+```c
+void clearprism_l1_flush(clearprism_l1_cache *l1);
+```
+
+Removes all entries from the L1 cache, resetting entry count, row count, byte count, and LRU pointers. Lifetime hit and miss counters are preserved. Safe to call with `NULL`.
+
+Thread-safe — acquires `l1->lock` during the operation.
+
+## Connection Pool Stats
+
+### clearprism_connpool_stats
+
+```c
+void clearprism_connpool_stats(clearprism_connpool *pool,
+                                int *out_open,
+                                int *out_max,
+                                int *out_checked_out,
+                                int64_t *out_total_checkouts);
+```
+
+Reads connection pool statistics under the pool lock. Any output pointer may be `NULL` to skip that stat. Safe to call with a `NULL` pool.
+
+| Output | Description |
+|--------|-------------|
+| `out_open` | Number of currently open connections |
+| `out_max` | Maximum pool capacity |
+| `out_checked_out` | Connections currently checked out by queries |
+| `out_total_checkouts` | Lifetime total checkout count |
+
 ## WHERE Clause Handling
 
 ### clearprism_where_encode
