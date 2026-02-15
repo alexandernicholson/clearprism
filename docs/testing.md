@@ -54,7 +54,7 @@ Expected output:
   PASS: column_accessors
   ...
 
-=== Results: 202/202 passed ===
+=== Results: 232/232 passed ===
 ```
 
 ## Test Structure
@@ -67,7 +67,7 @@ All tests are in the `test/` directory:
 | `test_registry.c` | Registry subsystem | Open/close, snapshot with priority ordering, invalid paths, NULL path |
 | `test_connpool.c` | Connection pool | Create/destroy, checkout/checkin, connection reuse, multiple DBs, LRU eviction, invalid paths |
 | `test_cache.c` | L1 + unified cache | Create/destroy, insert/lookup, LRU eviction, TTL expiry (2s sleep), unified cache facade |
-| `test_vtab.c` | End-to-end virtual table | Basic SELECT across 3 sources, `_source_db` filter, WHERE pushdown (LIKE, EQ, NE, GLOB, IS NULL, IS NOT NULL, IN), empty results, cache_db mode, composite rowids (stable + lookup), L1 cache population, OFFSET, ORDER BY (single-source), combined queries, registry auto-reload |
+| `test_vtab.c` | End-to-end virtual table | Basic SELECT across 3 sources, `_source_db` filter, WHERE pushdown (LIKE, EQ, NE, GLOB, IS NULL, IS NOT NULL, IN), empty results, cache_db mode, composite rowids (stable + lookup), L1 cache population, OFFSET, ORDER BY (single/multi-source), combined queries, registry auto-reload, parallel drain, snapshot mode (basic, WHERE, source_db, rowid, limit/offset, ORDER BY, L1 cache, destroy) |
 | `test_agg.c` | Aggregate pushdown | COUNT, SUM, MIN, MAX, AVG, GROUP BY pushdown |
 | `test_scanner.c` | Scanner API | Full scan, column accessors, source alias/id, column metadata, WHERE filter/range, callback iteration, early stop, empty sources, single source, NULL handling |
 
@@ -168,6 +168,14 @@ users: (20, 'Frank', 'frank@north.com')
 | `test_vtab_orderby_single_source` | `WHERE _source_db = 'west' ORDER BY name DESC` returns correctly ordered rows |
 | `test_vtab_in` | `WHERE name IN ('Alice', 'Charlie', 'Frank')` returns exactly 3 matching rows |
 | `test_vtab_combined` | Combined WHERE + ORDER BY + LIMIT on single source returns correct result |
+| `test_vtab_snapshot_basic` | Snapshot mode creates shadow table, returns correct row count |
+| `test_vtab_snapshot_where` | WHERE pushdown works against snapshot shadow table |
+| `test_vtab_snapshot_source_db` | `_source_db` filter works in snapshot mode |
+| `test_vtab_snapshot_rowid` | Composite rowids are stable and unique in snapshot mode |
+| `test_vtab_snapshot_limit_offset` | LIMIT/OFFSET works against snapshot shadow table |
+| `test_vtab_snapshot_orderby` | ORDER BY works against snapshot shadow table |
+| `test_vtab_snapshot_l1_cache` | L1 cache population works for snapshot queries |
+| `test_vtab_snapshot_destroy` | DROP TABLE cleans up snapshot shadow table |
 
 ### Scanner API Tests
 

@@ -759,8 +759,9 @@ static char *snapshot_build_query(clearprism_vtab *vtab, clearprism_query_plan *
 }
 
 /*
- * Populate the snapshot shadow table using the scanner API.
- * Called once from xCreate when mode='snapshot'.
+ * Populate the snapshot shadow table by directly opening each source DB
+ * and using type-specific binds for per-row INSERT.  Bypasses the scanner
+ * API to avoid sqlite3_value_dup overhead.
  */
 int clearprism_snapshot_populate(clearprism_vtab *vtab)
 {
@@ -787,77 +788,140 @@ int clearprism_snapshot_populate(clearprism_vtab *vtab)
     sqlite3_free(create_sql);
     if (rc != SQLITE_OK) return rc;
 
-    /* 2. Open scanner */
-    clearprism_scanner *sc = clearprism_scan_open(vtab->registry_path, vtab->target_table);
-    if (!sc) return SQLITE_ERROR;
+    /* 2. Registry snapshot — get source list */
+    clearprism_source *sources = NULL;
+    int n_sources = 0;
+    char *errmsg = NULL;
+    rc = clearprism_registry_snapshot(vtab->registry, vtab->target_table,
+                                      &sources, &n_sources, &errmsg);
+    if (rc != SQLITE_OK || n_sources == 0) {
+        sqlite3_free(errmsg);
+        if (sources) clearprism_sources_free(sources, n_sources);
+        goto create_index;
+    }
 
     /* 3. Build INSERT statement */
-    size_t ins_size = 256 + strlen(vtab->snapshot_table);
-    for (int i = 0; i < vtab->nCol; i++)
-        ins_size += strlen(vtab->cols[i].name) + 8;
+    {
+        size_t ins_size = 256 + strlen(vtab->snapshot_table);
+        for (int i = 0; i < vtab->nCol; i++)
+            ins_size += strlen(vtab->cols[i].name) + 8;
 
-    char *ins_sql = sqlite3_malloc((int)ins_size);
-    if (!ins_sql) {
-        clearprism_scan_close(sc);
-        return SQLITE_NOMEM;
-    }
-
-    pos = snprintf(ins_sql, ins_size, "INSERT INTO \"%s\"(rowid", vtab->snapshot_table);
-    for (int i = 0; i < vtab->nCol; i++)
-        pos += snprintf(ins_sql + pos, ins_size - pos, ", \"%s\"", vtab->cols[i].name);
-    pos += snprintf(ins_sql + pos, ins_size - pos, ", \"_source_db\") VALUES (?");
-    for (int i = 0; i < vtab->nCol; i++)
-        pos += snprintf(ins_sql + pos, ins_size - pos, ", ?");
-    pos += snprintf(ins_sql + pos, ins_size - pos, ", ?)");
-
-    sqlite3_stmt *ins = NULL;
-    rc = sqlite3_prepare_v2(vtab->host_db, ins_sql, -1, &ins, NULL);
-    sqlite3_free(ins_sql);
-    if (rc != SQLITE_OK) {
-        clearprism_scan_close(sc);
-        return rc;
-    }
-
-    /* 4. Loop: scan all rows and insert
-     * Note: xCreate runs inside SQLite's implicit transaction for
-     * CREATE VIRTUAL TABLE, so we don't need our own BEGIN/COMMIT. */
-    while (clearprism_scan_next(sc)) {
-        int64_t source_id = clearprism_scan_source_id(sc);
-        int64_t source_rowid = clearprism_scan_rowid(sc);
-        int64_t composite_rowid = (source_id << CLEARPRISM_ROWID_SHIFT) |
-                                   (source_rowid & CLEARPRISM_ROWID_MASK);
-
-        sqlite3_bind_int64(ins, 1, composite_rowid);
-
-        for (int c = 0; c < vtab->nCol; c++) {
-            sqlite3_value *val = clearprism_scan_value(sc, c);
-            if (val)
-                sqlite3_bind_value(ins, c + 2, val);
-            else
-                sqlite3_bind_null(ins, c + 2);
+        char *ins_sql = sqlite3_malloc((int)ins_size);
+        if (!ins_sql) {
+            clearprism_sources_free(sources, n_sources);
+            return SQLITE_NOMEM;
         }
 
-        const char *alias = clearprism_scan_source_alias(sc);
-        if (alias)
-            sqlite3_bind_text(ins, vtab->nCol + 2, alias, -1, SQLITE_TRANSIENT);
-        else
-            sqlite3_bind_null(ins, vtab->nCol + 2);
+        pos = snprintf(ins_sql, ins_size, "INSERT INTO \"%s\"(rowid", vtab->snapshot_table);
+        for (int i = 0; i < vtab->nCol; i++)
+            pos += snprintf(ins_sql + pos, ins_size - pos, ", \"%s\"", vtab->cols[i].name);
+        pos += snprintf(ins_sql + pos, ins_size - pos, ", \"_source_db\") VALUES (?");
+        for (int i = 0; i < vtab->nCol; i++)
+            pos += snprintf(ins_sql + pos, ins_size - pos, ", ?");
+        pos += snprintf(ins_sql + pos, ins_size - pos, ", ?)");
 
-        sqlite3_step(ins);
-        sqlite3_reset(ins);
+        sqlite3_stmt *ins = NULL;
+        rc = sqlite3_prepare_v2(vtab->host_db, ins_sql, -1, &ins, NULL);
+        sqlite3_free(ins_sql);
+        if (rc != SQLITE_OK) {
+            clearprism_sources_free(sources, n_sources);
+            return rc;
+        }
+
+        /* Build SELECT for reading from source DBs */
+        size_t sel_size = 256 + strlen(vtab->target_table);
+        for (int i = 0; i < vtab->nCol; i++)
+            sel_size += strlen(vtab->cols[i].name) + 8;
+
+        char *sel_sql = sqlite3_malloc((int)sel_size);
+        if (!sel_sql) {
+            sqlite3_finalize(ins);
+            clearprism_sources_free(sources, n_sources);
+            return SQLITE_NOMEM;
+        }
+
+        int sp = snprintf(sel_sql, sel_size, "SELECT rowid");
+        for (int i = 0; i < vtab->nCol; i++)
+            sp += snprintf(sel_sql + sp, sel_size - sp, ", \"%s\"",
+                            vtab->cols[i].name);
+        sp += snprintf(sel_sql + sp, sel_size - sp, " FROM \"%s\"",
+                        vtab->target_table);
+
+        /* 4. Direct-open each source, read rows, insert with type-specific binds */
+        for (int s = 0; s < n_sources; s++) {
+            sqlite3 *src_db = NULL;
+            int orc = sqlite3_open_v2(sources[s].path, &src_db,
+                                       SQLITE_OPEN_READONLY, NULL);
+            if (orc != SQLITE_OK) {
+                if (src_db) sqlite3_close(src_db);
+                continue;
+            }
+
+            sqlite3_stmt *sel_stmt = NULL;
+            orc = sqlite3_prepare_v2(src_db, sel_sql, -1, &sel_stmt, NULL);
+            if (orc != SQLITE_OK) { sqlite3_close(src_db); continue; }
+
+            while (sqlite3_step(sel_stmt) == SQLITE_ROW) {
+                int64_t src_rowid = sqlite3_column_int64(sel_stmt, 0);
+                int64_t composite = (sources[s].id << CLEARPRISM_ROWID_SHIFT) |
+                                     (src_rowid & CLEARPRISM_ROWID_MASK);
+                sqlite3_bind_int64(ins, 1, composite);
+
+                for (int c = 0; c < vtab->nCol; c++) {
+                    int col = c + 1;
+                    int vtype = sqlite3_column_type(sel_stmt, col);
+                    switch (vtype) {
+                    case SQLITE_INTEGER:
+                        sqlite3_bind_int64(ins, c + 2,
+                                            sqlite3_column_int64(sel_stmt, col));
+                        break;
+                    case SQLITE_FLOAT:
+                        sqlite3_bind_double(ins, c + 2,
+                                             sqlite3_column_double(sel_stmt, col));
+                        break;
+                    case SQLITE_TEXT:
+                        sqlite3_bind_text(ins, c + 2,
+                                           (const char *)sqlite3_column_text(sel_stmt, col),
+                                           -1, SQLITE_TRANSIENT);
+                        break;
+                    case SQLITE_BLOB:
+                        sqlite3_bind_blob(ins, c + 2,
+                                           sqlite3_column_blob(sel_stmt, col),
+                                           sqlite3_column_bytes(sel_stmt, col),
+                                           SQLITE_TRANSIENT);
+                        break;
+                    default:
+                        sqlite3_bind_null(ins, c + 2);
+                        break;
+                    }
+                }
+
+                sqlite3_bind_text(ins, vtab->nCol + 2, sources[s].alias,
+                                   -1, SQLITE_TRANSIENT);
+                sqlite3_step(ins);
+                sqlite3_reset(ins);
+            }
+
+            sqlite3_finalize(sel_stmt);
+            sqlite3_close(src_db);
+        }
+
+        sqlite3_finalize(ins);
+        sqlite3_free(sel_sql);
     }
 
-    /* 5. Finalize and close scanner */
-    sqlite3_finalize(ins);
-    clearprism_scan_close(sc);
+    clearprism_sources_free(sources, n_sources);
 
-    /* 7. Create index on _source_db */
-    char *idx_sql = clearprism_mprintf(
-        "CREATE INDEX IF NOT EXISTS \"%s_src\" ON \"%s\"(\"_source_db\")",
-        vtab->snapshot_table, vtab->snapshot_table);
-    if (idx_sql) {
-        sqlite3_exec(vtab->host_db, idx_sql, NULL, NULL, NULL);
-        sqlite3_free(idx_sql);
+create_index:
+    /* Create index on _source_db */
+    {
+        char *idx_sql = clearprism_mprintf(
+            "CREATE INDEX IF NOT EXISTS \"%s_src\" ON \"%s\"(\"_source_db\")",
+            vtab->snapshot_table, vtab->snapshot_table);
+        if (idx_sql) {
+            sqlite3_exec(vtab->host_db, idx_sql, NULL, NULL, NULL);
+            sqlite3_free(idx_sql);
+        }
     }
 
     return SQLITE_OK;

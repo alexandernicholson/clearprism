@@ -25,6 +25,7 @@ The extension registers a module named `"clearprism"` via `sqlite3_create_module
 3. Introspects the schema from the first active source via `PRAGMA table_info`
 4. Declares the virtual table schema to SQLite (with `_source_db TEXT HIDDEN` appended)
 5. Initializes the connection pool, L1 cache, and optionally L2 cache
+6. If `mode='snapshot'`, populates the snapshot shadow table (see [Snapshot Mode](#snapshot-mode))
 
 ## Module Registration
 
@@ -216,6 +217,41 @@ If the number of sources exceeds the configured `pool_max_open`, the pool limit 
 
 For multi-source `ORDER BY` queries, each source's SQL includes the `ORDER BY` clause. A min-heap over the source handles produces globally sorted output by repeatedly extracting the minimum element and stepping that source forward. This avoids materializing all rows before sorting.
 
+## Snapshot Mode
+
+When `mode='snapshot'` is specified, Clearprism materializes all source data into a shadow table at `CREATE VIRTUAL TABLE` time. Subsequent queries read from this local shadow table instead of opening source databases on each query.
+
+### Population Strategy
+
+The snapshot population (`clearprism_snapshot_populate`) bypasses both the virtual table protocol and the scanner API. Instead, it directly opens each source database with `sqlite3_open_v2(SQLITE_OPEN_READONLY)` and uses type-specific column binds to INSERT rows into the shadow table:
+
+```mermaid
+flowchart TD
+    START["xCreate with mode='snapshot'"] --> DDL["CREATE TABLE shadow_table(...)"]
+    DDL --> REG["Registry snapshot → source list"]
+    REG --> LOOP["For each source"]
+    LOOP --> OPEN["sqlite3_open_v2(source.db, READONLY)"]
+    OPEN --> SEL["SELECT rowid, col1, ... FROM target_table"]
+    SEL --> BIND["Type-specific bind:\nINTEGER → bind_int64\nTEXT → bind_text\nFLOAT → bind_double\nBLOB → bind_blob\nNULL → bind_null"]
+    BIND --> INS["INSERT INTO shadow_table"]
+    INS --> NEXT{"More rows?"}
+    NEXT -- YES --> BIND
+    NEXT -- NO --> CLOSE["sqlite3_close(source.db)"]
+    CLOSE --> MORE{"More sources?"}
+    MORE -- YES --> OPEN
+    MORE -- NO --> IDX["CREATE INDEX ON _source_db"]
+```
+
+Each row gets a composite rowid: `(source_id << 40) | (source_rowid & CLEARPRISM_ROWID_MASK)`.
+
+### Why Direct Open + Type-Specific Binds
+
+The scanner API uses `sqlite3_value_dup` + `sqlite3_bind_value` per cell, which allocates a new `sqlite3_value` for every column of every row. For 100K rows × 6 columns, that's 600K malloc/free pairs. Direct opening with type-specific binds (`sqlite3_bind_int64`, `sqlite3_bind_text`, etc.) copies column data directly without intermediate allocation, yielding ~15% faster population.
+
+### Query Path
+
+Once populated, snapshot queries go through the standard xBestIndex/xFilter/xNext/xColumn path but read from the shadow table via a prepared `SELECT` statement instead of opening source databases. L1 cache works normally — the first query populates L1, subsequent queries serve from cache.
+
 ## Scanner API Architecture
 
 The Scanner API (`clearprism_scanner.c`) provides a streaming iteration interface that bypasses the SQLite virtual table protocol entirely. While the vtab interface is ideal for SQL integration and caching, it incurs inherent per-row overhead from the VDBE dispatch loop (xEof + xNext + xColumn×N + xRowid per row). For bulk scans across many sources, this overhead is ~2x vs direct SQLite.
@@ -399,6 +435,8 @@ make bench                          # run all scenarios
 ./clearprism_bench source_scale     # run one scenario
 ```
 
-Scenarios: `baseline`, `source_scale`, `cache`, `where`, `orderby`, `row_scale`, `concurrent`, `federation`. Results are appended to `bench_results.csv` for tracking across runs.
+Scenarios: `baseline`, `source_scale`, `cache`, `where`, `orderby`, `row_scale`, `concurrent`, `federation`, `drain`, `agg_pushdown`, `snapshot`. Results are appended to `bench_results.csv` for tracking across runs.
 
 The `federation` scenario compares direct SQLite, virtual table, and scanner API on a full scan of 100 sources × 1M rows.
+
+The `snapshot` scenario compares snapshot population approaches (direct-open with type-specific binds vs scanner API) at multiple scales (10×1K, 10×10K, 100×1K rows).

@@ -1566,6 +1566,207 @@ static void bench_scenario_agg_pushdown(void)
     bench_cleanup();
 }
 
+/* ========== Snapshot population ========== */
+
+static void bench_scenario_snapshot(void)
+{
+    struct { int n_src; int rows_per; const char *label; } configs[] = {
+        {10,  1000,  "10x1K"},
+        {10,  10000, "10x10K"},
+        {100, 1000,  "100x1K"},
+    };
+    int n_configs = (int)(sizeof(configs) / sizeof(configs[0]));
+
+    for (int ci = 0; ci < n_configs; ci++) {
+        int n_src = configs[ci].n_src;
+        int rows_per = configs[ci].rows_per;
+
+        printf("\n--- Snapshot Population: %s (%dK total rows) ---\n",
+               configs[ci].label, n_src * rows_per / 1000);
+        bench_setup_dir();
+
+        char reg_path[256];
+        snprintf(reg_path, sizeof(reg_path), "%s/registry.db", BENCH_TMP_DIR);
+
+        const char **paths = malloc(n_src * sizeof(char *));
+        const char **aliases = malloc(n_src * sizeof(char *));
+        char **path_bufs = malloc(n_src * sizeof(char *));
+        char **alias_bufs = malloc(n_src * sizeof(char *));
+
+        for (int i = 0; i < n_src; i++) {
+            path_bufs[i] = malloc(256);
+            alias_bufs[i] = malloc(32);
+            snprintf(path_bufs[i], 256, "%s/src_%d.db", BENCH_TMP_DIR, i);
+            snprintf(alias_bufs[i], 32, "src_%03d", i);
+            paths[i] = path_bufs[i];
+            aliases[i] = alias_bufs[i];
+            bench_create_source_db(path_bufs[i], rows_per, 42 + i);
+        }
+        bench_create_registry(reg_path, paths, aliases, n_src);
+
+        print_header();
+
+        {
+            bench_timer t; timer_init(&t, 30);
+            int64_t total_rows = 0;
+
+            /* Warmup */
+            {
+                sqlite3 *db;
+                sqlite3_open(":memory:", &db);
+                clearprism_init(db);
+                char *sql = sqlite3_mprintf(
+                    "CREATE VIRTUAL TABLE bench_items USING clearprism("
+                    "  registry_db='%s', table='items', mode='snapshot')", reg_path);
+                sqlite3_exec(db, sql, NULL, NULL, NULL);
+                sqlite3_free(sql);
+                sqlite3_exec(db, "DROP TABLE bench_items", NULL, NULL, NULL);
+                sqlite3_close(db);
+            }
+
+            int iters = (n_src * rows_per > 100000) ? 3 : 10;
+            for (int i = 0; i < iters; i++) {
+                sqlite3 *db;
+                sqlite3_open(":memory:", &db);
+                clearprism_init(db);
+                char *sql = sqlite3_mprintf(
+                    "CREATE VIRTUAL TABLE bench_items USING clearprism("
+                    "  registry_db='%s', table='items', mode='snapshot')", reg_path);
+                double t0 = bench_now_us();
+                sqlite3_exec(db, sql, NULL, NULL, NULL);
+                double elapsed = bench_now_us() - t0;
+                sqlite3_free(sql);
+
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM bench_items",
+                                   -1, &stmt, NULL);
+                int64_t rows = 0;
+                if (sqlite3_step(stmt) == SQLITE_ROW)
+                    rows = sqlite3_column_int64(stmt, 0);
+                sqlite3_finalize(stmt);
+                total_rows += rows;
+
+                timer_record(&t, elapsed);
+                sqlite3_exec(db, "DROP TABLE bench_items", NULL, NULL, NULL);
+                sqlite3_close(db);
+            }
+
+            bench_stats s; timer_compute(&t, total_rows, &s);
+            print_row("direct_open", &s);
+            csv_append("snapshot", "direct_open", &s);
+            timer_free(&t);
+        }
+
+        /* Scanner API: the old approach using clearprism_scan_* with
+         * sqlite3_value_dup + sqlite3_bind_value per cell */
+        {
+            bench_timer t; timer_init(&t, 30);
+            int64_t total_rows = 0;
+
+            /* Warmup */
+            {
+                sqlite3 *db;
+                sqlite3_open(":memory:", &db);
+                sqlite3_exec(db,
+                    "CREATE TABLE _snap(id INTEGER, category TEXT, name TEXT,"
+                    " value REAL, description TEXT, created_at TEXT,"
+                    " _source_db TEXT)", NULL, NULL, NULL);
+                sqlite3_stmt *ins;
+                sqlite3_prepare_v2(db,
+                    "INSERT INTO _snap(rowid,id,category,name,value,"
+                    "description,created_at,_source_db) VALUES(?,?,?,?,?,?,?,?)",
+                    -1, &ins, NULL);
+                clearprism_scanner *sc = clearprism_scan_open(reg_path, "items");
+                if (sc) {
+                    while (clearprism_scan_next(sc)) {
+                        int64_t sid = clearprism_scan_source_id(sc);
+                        int64_t rid = clearprism_scan_rowid(sc);
+                        sqlite3_bind_int64(ins, 1,
+                            (sid << CLEARPRISM_ROWID_SHIFT) |
+                            (rid & CLEARPRISM_ROWID_MASK));
+                        for (int c = 0; c < 6; c++) {
+                            sqlite3_value *v = clearprism_scan_value(sc, c);
+                            if (v) sqlite3_bind_value(ins, c + 2, v);
+                            else   sqlite3_bind_null(ins, c + 2);
+                        }
+                        const char *a = clearprism_scan_source_alias(sc);
+                        if (a) sqlite3_bind_text(ins, 8, a, -1, SQLITE_TRANSIENT);
+                        else   sqlite3_bind_null(ins, 8);
+                        sqlite3_step(ins);
+                        sqlite3_reset(ins);
+                    }
+                    clearprism_scan_close(sc);
+                }
+                sqlite3_finalize(ins);
+                sqlite3_exec(db, "DROP TABLE _snap", NULL, NULL, NULL);
+                sqlite3_close(db);
+            }
+
+            int iters = (n_src * rows_per > 100000) ? 3 : 10;
+            for (int i = 0; i < iters; i++) {
+                sqlite3 *db;
+                sqlite3_open(":memory:", &db);
+                sqlite3_exec(db,
+                    "CREATE TABLE _snap(id INTEGER, category TEXT, name TEXT,"
+                    " value REAL, description TEXT, created_at TEXT,"
+                    " _source_db TEXT)", NULL, NULL, NULL);
+                sqlite3_stmt *ins;
+                sqlite3_prepare_v2(db,
+                    "INSERT INTO _snap(rowid,id,category,name,value,"
+                    "description,created_at,_source_db) VALUES(?,?,?,?,?,?,?,?)",
+                    -1, &ins, NULL);
+
+                double t0 = bench_now_us();
+                clearprism_scanner *sc = clearprism_scan_open(reg_path, "items");
+                if (sc) {
+                    while (clearprism_scan_next(sc)) {
+                        int64_t sid = clearprism_scan_source_id(sc);
+                        int64_t rid = clearprism_scan_rowid(sc);
+                        sqlite3_bind_int64(ins, 1,
+                            (sid << CLEARPRISM_ROWID_SHIFT) |
+                            (rid & CLEARPRISM_ROWID_MASK));
+                        for (int c = 0; c < 6; c++) {
+                            sqlite3_value *v = clearprism_scan_value(sc, c);
+                            if (v) sqlite3_bind_value(ins, c + 2, v);
+                            else   sqlite3_bind_null(ins, c + 2);
+                        }
+                        const char *a = clearprism_scan_source_alias(sc);
+                        if (a) sqlite3_bind_text(ins, 8, a, -1, SQLITE_TRANSIENT);
+                        else   sqlite3_bind_null(ins, 8);
+                        sqlite3_step(ins);
+                        sqlite3_reset(ins);
+                    }
+                    clearprism_scan_close(sc);
+                }
+                double elapsed = bench_now_us() - t0;
+
+                sqlite3_stmt *cnt;
+                sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM _snap",
+                                   -1, &cnt, NULL);
+                int64_t rows = 0;
+                if (sqlite3_step(cnt) == SQLITE_ROW)
+                    rows = sqlite3_column_int64(cnt, 0);
+                sqlite3_finalize(cnt);
+                total_rows += rows;
+
+                timer_record(&t, elapsed);
+                sqlite3_finalize(ins);
+                sqlite3_exec(db, "DROP TABLE _snap", NULL, NULL, NULL);
+                sqlite3_close(db);
+            }
+
+            bench_stats s; timer_compute(&t, total_rows, &s);
+            print_row("scanner_api", &s);
+            csv_append("snapshot", "scanner_api", &s);
+            timer_free(&t);
+        }
+
+        for (int i = 0; i < n_src; i++) { free(path_bufs[i]); free(alias_bufs[i]); }
+        free(paths); free(aliases); free(path_bufs); free(alias_bufs);
+        bench_cleanup();
+    }
+}
+
 /* ========== Main ========== */
 
 int main(int argc, char **argv)
@@ -1588,6 +1789,7 @@ int main(int argc, char **argv)
         {"federation",    bench_scenario_federation},
         {"drain",         bench_scenario_drain},
         {"agg_pushdown",  bench_scenario_agg_pushdown},
+        {"snapshot",      bench_scenario_snapshot},
     };
     int n_scenarios = (int)(sizeof(scenarios) / sizeof(scenarios[0]));
 

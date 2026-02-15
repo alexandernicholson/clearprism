@@ -66,6 +66,26 @@ Maximum number of simultaneously open connections to source databases. When this
 
 Choose this value based on your operating system's file descriptor limits and the number of source databases. A value of 32 is conservative; systems with higher `ulimit -n` values can safely use 64 or more.
 
+### mode (optional)
+
+Operating mode for the virtual table.
+
+| | |
+|---|---|
+| **Default** | `live` |
+| **Type** | String (`live` or `snapshot`) |
+
+- `live` (default): Queries open source databases on demand, with optional L1/L2 caching.
+- `snapshot`: Materializes all source data into a local shadow table at `CREATE VIRTUAL TABLE` time. Queries read from the shadow table. Ideal for workloads where source data doesn't change during the session and fast repeated queries are needed.
+
+```sql
+CREATE VIRTUAL TABLE t USING clearprism(
+    registry_db='registry.db',
+    table='users',
+    mode='snapshot'
+);
+```
+
 ### l2_refresh_sec (optional)
 
 Interval in seconds between L2 shadow table refreshes. The background refresh thread sleeps for this duration between full refresh cycles.

@@ -52,6 +52,7 @@ clearprism_scan_close(sc);
 - **Registry auto-reload** detects source list changes without restarting
 - **Resilient** — skips unavailable sources instead of failing the entire query
 - **Thread-safe** with per-component locking and a strict lock hierarchy
+- **Snapshot mode** materializes all source data into a local shadow table for fast repeated queries
 - **Streaming Scanner API** for zero-vtab-overhead bulk iteration (~1.09x direct SQLite speed)
 
 ## Quick Start
@@ -119,6 +120,7 @@ All parameters are passed as `key=value` pairs in the `CREATE VIRTUAL TABLE` sta
 |-----------|----------|---------|-------------|
 | `registry_db` | Yes | — | Path to the registry database |
 | `table` | Yes | — | Name of the table to federate |
+| `mode` | No | `live` | `live` (query on demand) or `snapshot` (materialize at creation) |
 | `cache_db` | No | — | Path for L2 disk cache (enables shadow tables) |
 | `l1_max_rows` | No | `10000` | Maximum rows in L1 memory cache |
 | `l1_max_bytes` | No | `67108864` | Maximum bytes in L1 cache (64 MiB) |
