@@ -1574,6 +1574,7 @@ static void bench_scenario_snapshot(void)
         {10,  1000,  "10x1K"},
         {10,  10000, "10x10K"},
         {100, 1000,  "100x1K"},
+        {1000, 1000, "1000x1K"},
     };
     int n_configs = (int)(sizeof(configs) / sizeof(configs[0]));
 
