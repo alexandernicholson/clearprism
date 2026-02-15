@@ -264,6 +264,22 @@ static void test_scanner_where_range(void)
     scan_cleanup();
 }
 
+typedef struct { int count; double sum; } scan_each_agg_ctx;
+
+static int scan_stop_callback(clearprism_scanner *sc, void *arg) {
+    (void)sc;
+    scan_each_agg_ctx *c = (scan_each_agg_ctx *)arg;
+    c->count++;
+    return c->count >= 50 ? 1 : 0;
+}
+
+static int scan_each_callback(clearprism_scanner *sc, void *arg) {
+    scan_each_agg_ctx *a = (scan_each_agg_ctx *)arg;
+    a->count++;
+    a->sum += clearprism_scan_double(sc, 3);
+    return 0;
+}
+
 static void test_scanner_scan_each(void)
 {
     scan_setup(3, 100);
@@ -272,18 +288,9 @@ static void test_scanner_scan_each(void)
     test_report("scanner_each: open", s != NULL);
     if (!s) { scan_cleanup(); return; }
 
-    /* Count rows and sum values via callback */
-    typedef struct { int count; double sum; } agg_ctx;
-    agg_ctx ctx = {0, 0.0};
+    scan_each_agg_ctx ctx = {0, 0.0};
 
-    int callback(clearprism_scanner *sc, void *arg) {
-        agg_ctx *a = (agg_ctx *)arg;
-        a->count++;
-        a->sum += clearprism_scan_double(sc, 3);
-        return 0;
-    }
-
-    int rc = clearprism_scan_each(s, callback, &ctx);
+    int rc = clearprism_scan_each(s, scan_each_callback, &ctx);
     test_report("scanner_each: returns OK", rc == SQLITE_OK);
     test_report("scanner_each: counted 300 rows", ctx.count == 300);
 
@@ -307,17 +314,9 @@ static void test_scanner_early_stop(void)
     if (!s) { scan_cleanup(); return; }
 
     /* Stop after 50 rows */
-    typedef struct { int count; } stop_ctx;
-    stop_ctx ctx = {0};
+    scan_each_agg_ctx ctx = {0, 0.0};
 
-    int callback(clearprism_scanner *sc, void *arg) {
-        (void)sc;
-        stop_ctx *c = (stop_ctx *)arg;
-        c->count++;
-        return c->count >= 50 ? 1 : 0;
-    }
-
-    int rc = clearprism_scan_each(s, callback, &ctx);
+    int rc = clearprism_scan_each(s, scan_stop_callback, &ctx);
     test_report("scanner_stop: callback returned non-zero", rc == 1);
     test_report("scanner_stop: stopped at 50 rows", ctx.count == 50);
 
