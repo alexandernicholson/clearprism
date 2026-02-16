@@ -489,6 +489,7 @@ clearprism_l2_cache *clearprism_l2_create(const char *cache_db_path,
                                            clearprism_connpool *pool,
                                            char **errmsg);
 void clearprism_l2_destroy(clearprism_l2_cache *l2);
+int  clearprism_l2_populate(clearprism_l2_cache *l2, char **errmsg);
 int  clearprism_l2_start_refresh(clearprism_l2_cache *l2, char **errmsg);
 sqlite3_stmt *clearprism_l2_query(clearprism_l2_cache *l2,
                                    const char *where_clause,
