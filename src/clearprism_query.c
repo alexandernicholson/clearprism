@@ -1372,11 +1372,27 @@ int clearprism_vtab_filter(sqlite3_vtab_cursor *pCur, int idxNum,
         clearprism_cache_cursor *cc = NULL;
         int cache_hit = clearprism_cache_lookup(vtab->cache, cache_key, &cc);
         if (cache_hit && cc) {
-            cur->cache_cursor = cc;
-            cur->serving_from_cache = 1;
-            if (clearprism_cache_cursor_eof(cc))
-                cur->eof = 1;
-            return SQLITE_OK;
+            /* L2 cache cursors only support simple full scans — if the query
+             * needs LIMIT, OFFSET, or ORDER BY, free the L2 cursor and fall
+             * through to the live path which handles them properly.
+             * L1 cursors are already filtered/limited, so they're always OK. */
+            int l2_backed = (cc->l2_stmt != NULL);
+            int has_limit_or_order = (cur->limit_remaining >= 0) ||
+                                     (cur->offset_remaining > 0) ||
+                                     (cur->plan.flags & (CLEARPRISM_PLAN_HAS_ORDER |
+                                                          CLEARPRISM_PLAN_HAS_MERGE_ORDER));
+            if (l2_backed && has_limit_or_order) {
+                clearprism_cache_cursor_free(cc);
+                cc = NULL;
+            } else {
+                cur->cache_cursor = cc;
+                cur->serving_from_cache = 1;
+                if (l2_backed)
+                    cur->row_counter++;
+                if (clearprism_cache_cursor_eof(cc))
+                    cur->eof = 1;
+                return SQLITE_OK;
+            }
         }
     }
 
@@ -1862,6 +1878,8 @@ int clearprism_vtab_next(sqlite3_vtab_cursor *pCur)
         clearprism_cache_cursor_next(cur->cache_cursor);
         if (clearprism_cache_cursor_eof(cur->cache_cursor))
             cur->eof = 1;
+        else
+            cur->row_counter++;
         return SQLITE_OK;
     }
 
@@ -2069,7 +2087,11 @@ int clearprism_vtab_rowid(sqlite3_vtab_cursor *pCur, sqlite3_int64 *pRowid)
     }
 
     if (cur->serving_from_cache && cur->cache_cursor) {
-        *pRowid = cur->cache_cursor->current_rowid;
+        /* L2 cursors use row_counter; L1 cursors have composite rowids */
+        if (cur->cache_cursor->l2_stmt)
+            *pRowid = cur->row_counter;
+        else
+            *pRowid = cur->cache_cursor->current_rowid;
         return SQLITE_OK;
     }
 

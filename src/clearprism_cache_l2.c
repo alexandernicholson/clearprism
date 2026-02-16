@@ -47,6 +47,7 @@ clearprism_l2_cache *clearprism_l2_create(const char *cache_db_path,
     }
     memset(l2, 0, sizeof(*l2));
     pthread_mutex_init(&l2->lock, NULL);
+    pthread_cond_init(&l2->populate_done_cond, NULL);
 
     l2->cache_db_path = clearprism_strdup(cache_db_path);
     l2->target_table = clearprism_strdup(target_table);
@@ -81,8 +82,6 @@ clearprism_l2_cache *clearprism_l2_create(const char *cache_db_path,
         return NULL;
     }
 
-    /* Enable WAL mode on reader */
-    sqlite3_exec(l2->reader_db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
     sqlite3_busy_timeout(l2->reader_db, 5000);
 
     /* Open writer connection (for background refresh thread) */
@@ -95,7 +94,6 @@ clearprism_l2_cache *clearprism_l2_create(const char *cache_db_path,
         clearprism_l2_destroy(l2);
         return NULL;
     }
-    sqlite3_exec(l2->writer_db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
     sqlite3_busy_timeout(l2->writer_db, 10000);
 
     /* Create shadow table and meta table */
@@ -112,10 +110,11 @@ void clearprism_l2_destroy(clearprism_l2_cache *l2)
 {
     if (!l2) return;
 
-    /* Stop refresh thread */
+    /* Stop refresh thread — broadcast condvar to wake any waiting queries */
     pthread_mutex_lock(&l2->lock);
     if (l2->running) {
         l2->running = 0;
+        pthread_cond_broadcast(&l2->populate_done_cond);
         pthread_mutex_unlock(&l2->lock);
         pthread_join(l2->refresh_thread, NULL);
     } else {
@@ -137,6 +136,7 @@ void clearprism_l2_destroy(clearprism_l2_cache *l2)
         sqlite3_free(l2->cols);
     }
 
+    pthread_cond_destroy(&l2->populate_done_cond);
     pthread_mutex_destroy(&l2->lock);
     sqlite3_free(l2);
 }
@@ -173,6 +173,27 @@ int clearprism_l2_start_refresh(clearprism_l2_cache *l2, char **errmsg)
     return SQLITE_OK;
 }
 
+static char *l2_build_query_sql(clearprism_l2_cache *l2,
+                                const char *where_clause,
+                                const char *source_alias)
+{
+    if (source_alias && where_clause && where_clause[0]) {
+        return clearprism_mprintf(
+            "SELECT * FROM \"%s\" WHERE _cp_source_alias = '%s' AND %s",
+            l2->shadow_table_name, source_alias, where_clause);
+    } else if (source_alias) {
+        return clearprism_mprintf(
+            "SELECT * FROM \"%s\" WHERE _cp_source_alias = '%s'",
+            l2->shadow_table_name, source_alias);
+    } else if (where_clause && where_clause[0]) {
+        return clearprism_mprintf(
+            "SELECT * FROM \"%s\" WHERE %s",
+            l2->shadow_table_name, where_clause);
+    } else {
+        return clearprism_mprintf("SELECT * FROM \"%s\"", l2->shadow_table_name);
+    }
+}
+
 sqlite3_stmt *clearprism_l2_query(clearprism_l2_cache *l2,
                                    const char *where_clause,
                                    const char *source_alias,
@@ -180,24 +201,7 @@ sqlite3_stmt *clearprism_l2_query(clearprism_l2_cache *l2,
 {
     if (!l2 || !l2->reader_db) return NULL;
 
-    /* Build SELECT from shadow table */
-    char *sql;
-    if (source_alias && where_clause && where_clause[0]) {
-        sql = clearprism_mprintf(
-            "SELECT * FROM \"%s\" WHERE _cp_source_alias = '%s' AND %s",
-            l2->shadow_table_name, source_alias, where_clause);
-    } else if (source_alias) {
-        sql = clearprism_mprintf(
-            "SELECT * FROM \"%s\" WHERE _cp_source_alias = '%s'",
-            l2->shadow_table_name, source_alias);
-    } else if (where_clause && where_clause[0]) {
-        sql = clearprism_mprintf(
-            "SELECT * FROM \"%s\" WHERE %s",
-            l2->shadow_table_name, where_clause);
-    } else {
-        sql = clearprism_mprintf("SELECT * FROM \"%s\"", l2->shadow_table_name);
-    }
-
+    char *sql = l2_build_query_sql(l2, where_clause, source_alias);
     if (!sql) {
         if (errmsg) *errmsg = clearprism_strdup("out of memory");
         return NULL;
@@ -215,6 +219,50 @@ sqlite3_stmt *clearprism_l2_query(clearprism_l2_cache *l2,
     return stmt;
 }
 
+sqlite3_stmt *clearprism_l2_query_ex(clearprism_l2_cache *l2,
+                                      const char *where_clause,
+                                      const char *source_alias,
+                                      char **errmsg,
+                                      sqlite3 **out_db)
+{
+    if (!l2 || !l2->cache_db_path || !out_db) return NULL;
+    *out_db = NULL;
+
+    /* Open a fresh connection to avoid WAL snapshot issues
+     * with the pre-opened reader_db */
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(l2->cache_db_path, &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, NULL);
+    if (rc != SQLITE_OK) {
+        if (errmsg) *errmsg = clearprism_mprintf("L2 query open failed: %s",
+                                                   db ? sqlite3_errmsg(db) : "");
+        if (db) sqlite3_close(db);
+        return NULL;
+    }
+    sqlite3_busy_timeout(db, 5000);
+
+    char *sql = l2_build_query_sql(l2, where_clause, source_alias);
+    if (!sql) {
+        if (errmsg) *errmsg = clearprism_strdup("out of memory");
+        sqlite3_close(db);
+        return NULL;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    sqlite3_free(sql);
+
+    if (rc != SQLITE_OK) {
+        if (errmsg) *errmsg = clearprism_mprintf("L2 query prepare failed: %s",
+                                                   sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return NULL;
+    }
+
+    *out_db = db;
+    return stmt;
+}
+
 int clearprism_l2_is_fresh(clearprism_l2_cache *l2)
 {
     if (!l2) return 0;
@@ -224,6 +272,24 @@ int clearprism_l2_is_fresh(clearprism_l2_cache *l2)
                  (now - l2->last_refresh) < l2->refresh_interval_sec);
     pthread_mutex_unlock(&l2->lock);
     return fresh;
+}
+
+void clearprism_l2_wait_ready(clearprism_l2_cache *l2)
+{
+    if (!l2) return;
+    pthread_mutex_lock(&l2->lock);
+    while (!l2->initial_populate_done && l2->running)
+        pthread_cond_wait(&l2->populate_done_cond, &l2->lock);
+    pthread_mutex_unlock(&l2->lock);
+}
+
+int clearprism_l2_is_ready(clearprism_l2_cache *l2)
+{
+    if (!l2) return 0;
+    pthread_mutex_lock(&l2->lock);
+    int ready = l2->initial_populate_done;
+    pthread_mutex_unlock(&l2->lock);
+    return ready;
 }
 
 /* ---------- Internal helpers ---------- */
@@ -547,8 +613,14 @@ static void *l2_refresh_thread_func(void *arg)
 {
     clearprism_l2_cache *l2 = (clearprism_l2_cache *)arg;
 
-    /* Initial populate — runs async, first query serves from sources directly */
+    /* Initial populate — first query waits for this to complete */
     l2_do_refresh(l2);
+
+    /* Signal waiting queries that L2 is ready */
+    pthread_mutex_lock(&l2->lock);
+    l2->initial_populate_done = 1;
+    pthread_cond_broadcast(&l2->populate_done_cond);
+    pthread_mutex_unlock(&l2->lock);
 
     while (1) {
         /* Sleep for refresh interval, checking running flag periodically */

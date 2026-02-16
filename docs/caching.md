@@ -76,7 +76,7 @@ flowchart TD
 
 ## L2: Shadow Table Cache
 
-The L2 cache materializes a copy of all source data into a local SQLite database. It is auto-enabled by default (at `/tmp/clearprism_cache_{vtab}_{table}.db`); set `cache_db='none'` to disable. The initial populate runs asynchronously in a background thread, so `CREATE VIRTUAL TABLE` returns immediately and the first query serves from sources directly.
+The L2 cache materializes a copy of all source data into a local SQLite database. It is auto-enabled by default (at `/tmp/clearprism_cache_{vtab}_{table}.db`); set `cache_db='none'` to disable. The initial populate runs asynchronously in a background thread, so `CREATE VIRTUAL TABLE` returns immediately. If the background populate has finished by the time a query runs, simple queries (full scans without ORDER BY/LIMIT) serve directly from the shadow table — avoiding the slow virtual table protocol path entirely. If the populate is still in progress, queries fall through to the live path without blocking.
 
 ### Shadow Table Schema
 
@@ -106,12 +106,9 @@ CREATE TABLE _clearprism_meta (
 );
 ```
 
-### WAL Mode
+### Journal Mode
 
-The L2 cache database runs in [WAL (Write-Ahead Logging) mode](https://www.sqlite.org/wal.html). This is the critical design choice that allows the background refresh thread to write without blocking query threads from reading. Two separate connections are used:
-
-- **Reader connection** (`reader_db`): Used by query threads to read the shadow table
-- **Writer connection** (`writer_db`): Used exclusively by the background refresh thread
+The L2 cache database uses DELETE journal mode. Query threads open a fresh read connection per query (closed when the cursor is freed) rather than sharing a long-lived reader connection. This avoids stale-snapshot issues that can occur with WAL mode when the writer updates the database between the reader's open and its first read. A writer connection (`writer_db`) is used exclusively by the background refresh thread.
 
 ### Background Refresh
 
@@ -147,7 +144,7 @@ Key details:
 - **Streaming refresh**: Rows are read from each source and inserted directly into the shadow table one at a time — O(1) memory regardless of dataset size. No buffering or `sqlite3_value_dup()` overhead.
 - **Incremental**: Only sources whose file mtime has changed since the last refresh are re-read. Unchanged sources are skipped entirely.
 - **Per-source commits**: Each changed source is refreshed in its own transaction (DELETE old rows + INSERT new rows + COMMIT), so partial failures don't roll back other sources.
-- **Async initial populate**: The first refresh runs in the background thread immediately after `CREATE VIRTUAL TABLE`. The first query serves from sources directly; subsequent queries benefit from the cache.
+- **Non-blocking L2**: The first refresh runs in the background thread immediately after `CREATE VIRTUAL TABLE`. If the populate has already finished when a simple query (no ORDER BY/LIMIT/OFFSET) runs, it serves directly from the shadow table — avoiding the slow virtual table protocol path (~10 indirect function calls per row). If the populate is still in progress, the query falls through to the live path without blocking. Queries with ORDER BY, LIMIT, or OFFSET always use the live path for correct handling.
 - The refresh thread opens its own dedicated connections to source databases (not from the shared pool) to avoid thread safety issues
 - Each source is processed independently — if one source fails, the others still get refreshed
 - The `running` flag is checked between each source to allow clean shutdown
@@ -162,7 +159,7 @@ L2 is considered "fresh" if `(now - last_refresh) < refresh_interval_sec`. When 
 | Event | Action |
 |-------|--------|
 | `xCreate` / `xConnect` | Create shadow table if not exists, start refresh thread |
-| `xFilter` (cache miss) | L2 queried via `clearprism_l2_query()` if fresh; result populates L1 |
+| `xFilter` (cache miss) | Non-blocking check via `clearprism_l2_is_ready()`; if L2 populate is done, query via `clearprism_l2_query_ex()` with a fresh connection; L2 cursors serve simple scans directly, complex queries (ORDER BY/LIMIT/OFFSET) fall through to live path |
 | `xDisconnect` / `xDestroy` | Set `running = 0`, join refresh thread, close both connections |
 
 ### Current Limitations

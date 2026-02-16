@@ -3,7 +3,7 @@
  *
  * Usage: ./clearprism_bench [scenario_name]
  *   No args = run all scenarios (~50s)
- *   Scenario names: baseline, source_scale, cache, where, orderby, row_scale, concurrent, federation
+ *   Scenario names: baseline, source_scale, cache, where, orderby, row_scale, concurrent, federation, drain, agg_pushdown, snapshot, multi_query
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -1822,6 +1822,281 @@ static void bench_scenario_snapshot(void)
     }
 }
 
+/* ========== Scenario 12: Multi-Query (L2 Wait-for-Ready) ========== */
+
+/*
+ * Measures the wait-for-L2 behavior: first query waits for L2 background
+ * populate, then serves from the shadow table. Subsequent queries serve
+ * from L2 immediately (no wait). Compared against L2-disabled baseline
+ * where every query goes through the live vtab path.
+ */
+static void bench_scenario_multi_query(void)
+{
+    printf("\n--- Multi-Query / L2 Wait-for-Ready ---\n");
+
+    struct { int n_src; int rows_per; const char *label; } configs[] = {
+        {10,  1000,  "10x1K"},
+        {10,  10000, "10x10K"},
+        {50,  1000,  "50x1K"},
+    };
+    int n_configs = (int)(sizeof(configs) / sizeof(configs[0]));
+
+    for (int ci = 0; ci < n_configs; ci++) {
+        int n_src = configs[ci].n_src;
+        int rows_per = configs[ci].rows_per;
+        int total = n_src * rows_per;
+
+        printf("\n  [%s — %dK total rows]\n", configs[ci].label, total / 1000);
+        bench_setup_dir();
+
+        char reg_path[256];
+        snprintf(reg_path, sizeof(reg_path), "%s/registry.db", BENCH_TMP_DIR);
+
+        const char **paths = malloc(n_src * sizeof(char *));
+        const char **aliases = malloc(n_src * sizeof(char *));
+        char **path_bufs = malloc(n_src * sizeof(char *));
+        char **alias_bufs = malloc(n_src * sizeof(char *));
+
+        for (int i = 0; i < n_src; i++) {
+            path_bufs[i] = malloc(256);
+            alias_bufs[i] = malloc(32);
+            snprintf(path_bufs[i], 256, "%s/src_%d.db", BENCH_TMP_DIR, i);
+            snprintf(alias_bufs[i], 32, "src_%03d", i);
+            paths[i] = path_bufs[i];
+            aliases[i] = alias_bufs[i];
+            bench_create_source_db(path_bufs[i], rows_per, 42 + i);
+        }
+        bench_create_registry(reg_path, paths, aliases, n_src);
+
+        printf("  %-24s | %10s | %12s | %10s\n",
+               "Query", "Wall Time", "Total Rows", "Rows/sec");
+        printf("  %-24s-+-%10s-+-%12s-+-%10s\n",
+               "------------------------", "----------", "------------", "----------");
+
+        /* --- L2 enabled (default): first query waits for L2, subsequent from cache --- */
+        {
+            sqlite3 *db;
+            sqlite3_open(":memory:", &db);
+            clearprism_init(db);
+            char *csql = sqlite3_mprintf(
+                "CREATE VIRTUAL TABLE mq_items USING clearprism("
+                "  registry_db='%s', table='items',"
+                "  pool_max_open=%d)", reg_path, n_src + 8);
+            sqlite3_exec(db, csql, NULL, NULL, NULL);
+            sqlite3_free(csql);
+
+            /* Query 1: full scan (waits for L2 background populate) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db, "SELECT * FROM mq_items",
+                                   -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("l2_first_full_scan", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            /* Query 2: same full scan again (L2 ready, no wait) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db, "SELECT * FROM mq_items",
+                                   -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("l2_second_full_scan", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            /* Query 3: filtered query (goes through live path, populates L1) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db,
+                    "SELECT * FROM mq_items WHERE category = 'cat_042'",
+                    -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("l2_filtered_cold", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            /* Query 4: same filtered query again (L1 hit) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db,
+                    "SELECT * FROM mq_items WHERE category = 'cat_042'",
+                    -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("l2_filtered_warm", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            /* Query 5: ORDER BY + LIMIT (bypasses L2, uses live path) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db,
+                    "SELECT * FROM mq_items ORDER BY value LIMIT 100",
+                    -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("l2_order_limit", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            sqlite3_exec(db, "DROP TABLE mq_items", NULL, NULL, NULL);
+            sqlite3_close(db);
+        }
+
+        /* --- L2 disabled: every query goes through live vtab path --- */
+        {
+            sqlite3 *db;
+            sqlite3_open(":memory:", &db);
+            clearprism_init(db);
+            char *csql = sqlite3_mprintf(
+                "CREATE VIRTUAL TABLE mq_items USING clearprism("
+                "  registry_db='%s', table='items',"
+                "  cache_db='none', pool_max_open=%d)", reg_path, n_src + 8);
+            sqlite3_exec(db, csql, NULL, NULL, NULL);
+            sqlite3_free(csql);
+
+            /* Query 1: full scan (no L2, live path) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db, "SELECT * FROM mq_items",
+                                   -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("nol2_first_full_scan", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            /* Query 2: same full scan (L1 hit if it fit) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db, "SELECT * FROM mq_items",
+                                   -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("nol2_second_full_scan", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            /* Query 3: filtered (cold, live path) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db,
+                    "SELECT * FROM mq_items WHERE category = 'cat_042'",
+                    -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("nol2_filtered_cold", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            /* Query 4: filtered warm (L1 hit) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db,
+                    "SELECT * FROM mq_items WHERE category = 'cat_042'",
+                    -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("nol2_filtered_warm", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            /* Query 5: ORDER BY + LIMIT (live path both times) */
+            {
+                sqlite3_stmt *stmt;
+                sqlite3_prepare_v2(db,
+                    "SELECT * FROM mq_items ORDER BY value LIMIT 100",
+                    -1, &stmt, NULL);
+                double t0 = bench_now_us();
+                int64_t rows = 0;
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int nc = sqlite3_column_count(stmt);
+                    for (int c = 0; c < nc; c++) sqlite3_column_value(stmt, c);
+                    rows++;
+                }
+                double wall = bench_now_us() - t0;
+                sqlite3_finalize(stmt);
+                fed_row("nol2_order_limit", wall, rows,
+                        "multi_query", configs[ci].label);
+            }
+
+            sqlite3_exec(db, "DROP TABLE mq_items", NULL, NULL, NULL);
+            sqlite3_close(db);
+        }
+
+        for (int i = 0; i < n_src; i++) { free(path_bufs[i]); free(alias_bufs[i]); }
+        free(paths); free(aliases); free(path_bufs); free(alias_bufs);
+        bench_cleanup();
+    }
+}
+
 /* ========== Main ========== */
 
 int main(int argc, char **argv)
@@ -1853,6 +2128,7 @@ int main(int argc, char **argv)
         {"drain",         bench_scenario_drain},
         {"agg_pushdown",  bench_scenario_agg_pushdown},
         {"snapshot",      bench_scenario_snapshot},
+        {"multi_query",   bench_scenario_multi_query},
     };
     int n_scenarios = (int)(sizeof(scenarios) / sizeof(scenarios[0]));
 

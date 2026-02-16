@@ -649,6 +649,11 @@ static void test_admin_l2_incremental_refresh(void)
        DROP and recreate the vtab (which does a fresh L2 populate). */
     sqlite3_exec(db, "DROP TABLE test_items", NULL, NULL, NULL);
 
+    /* Delete stale L2 cache so fresh populate picks up the new row.
+     * Without this, mtime-based detection might miss sub-second changes. */
+    unlink("/tmp/clearprism_cache_test_items_items.db");
+    unlink("/tmp/clearprism_cache_test_items_items.db-journal");
+
     sql = sqlite3_mprintf(
         "CREATE VIRTUAL TABLE test_items USING clearprism("
         "  registry_db='%s', table='items')", ADMIN_REG_PATH);
