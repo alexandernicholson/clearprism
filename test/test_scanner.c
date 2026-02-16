@@ -452,6 +452,119 @@ static void test_scanner_source_id(void)
     scan_cleanup();
 }
 
+/* ========== Parallel scan ========== */
+
+struct par_count_ctx { int64_t rows; };
+
+static int par_count_cb(sqlite3_stmt *stmt, int n_cols,
+                         const char *source_alias, int thread_id,
+                         void *user_ctx)
+{
+    (void)stmt; (void)n_cols; (void)source_alias;
+    struct par_count_ctx *ctxs = (struct par_count_ctx *)user_ctx;
+    ctxs[thread_id].rows++;
+    return 0;
+}
+
+static void test_scanner_parallel(void)
+{
+    scan_setup(4, 100);
+
+    clearprism_scanner *s = clearprism_scan_open(SCAN_REG_PATH, "items");
+    test_report("scanner_parallel: open", s != NULL);
+    if (!s) { scan_cleanup(); return; }
+
+    struct par_count_ctx ctxs[4];
+    memset(ctxs, 0, sizeof(ctxs));
+
+    int rc = clearprism_scan_parallel(s, 4, par_count_cb, ctxs);
+    test_report("scanner_parallel: returns OK", rc == SQLITE_OK);
+
+    int64_t total = 0;
+    for (int i = 0; i < 4; i++) total += ctxs[i].rows;
+    test_report("scanner_parallel: total 400 rows", total == 400);
+
+    /* Scanner should be consumed (eof) */
+    int more = clearprism_scan_next(s);
+    test_report("scanner_parallel: eof after parallel", more == 0);
+
+    clearprism_scan_close(s);
+    scan_cleanup();
+}
+
+static int par_touch_cb(sqlite3_stmt *stmt, int n_cols,
+                         const char *source_alias, int thread_id,
+                         void *user_ctx)
+{
+    (void)source_alias;
+    struct par_count_ctx *ctxs = (struct par_count_ctx *)user_ctx;
+    /* Touch every column to verify zero-copy access */
+    for (int c = 0; c < n_cols; c++)
+        sqlite3_column_type(stmt, c + CLEARPRISM_COL_OFFSET);
+    ctxs[thread_id].rows++;
+    return 0;
+}
+
+static void test_scanner_parallel_column_access(void)
+{
+    scan_setup(3, 50);
+
+    clearprism_scanner *s = clearprism_scan_open(SCAN_REG_PATH, "items");
+    test_report("scanner_par_cols: open", s != NULL);
+    if (!s) { scan_cleanup(); return; }
+
+    struct par_count_ctx ctxs[3];
+    memset(ctxs, 0, sizeof(ctxs));
+
+    int rc = clearprism_scan_parallel(s, 3, par_touch_cb, ctxs);
+    test_report("scanner_par_cols: returns OK", rc == SQLITE_OK);
+
+    int64_t total = 0;
+    for (int i = 0; i < 3; i++) total += ctxs[i].rows;
+    test_report("scanner_par_cols: total 150 rows", total == 150);
+
+    clearprism_scan_close(s);
+    scan_cleanup();
+}
+
+static int par_stop_cb(sqlite3_stmt *stmt, int n_cols,
+                        const char *source_alias, int thread_id,
+                        void *user_ctx)
+{
+    (void)stmt; (void)n_cols; (void)source_alias;
+    struct par_count_ctx *ctxs = (struct par_count_ctx *)user_ctx;
+    ctxs[thread_id].rows++;
+    /* Stop after 10 rows per thread */
+    return ctxs[thread_id].rows >= 10 ? 1 : 0;
+}
+
+static void test_scanner_parallel_early_stop(void)
+{
+    scan_setup(4, 100);
+
+    clearprism_scanner *s = clearprism_scan_open(SCAN_REG_PATH, "items");
+    test_report("scanner_par_stop: open", s != NULL);
+    if (!s) { scan_cleanup(); return; }
+
+    struct par_count_ctx ctxs[4];
+    memset(ctxs, 0, sizeof(ctxs));
+
+    clearprism_scan_parallel(s, 4, par_stop_cb, ctxs);
+
+    /* Each thread should have stopped at <= 10 rows */
+    int all_stopped = 1;
+    int64_t total = 0;
+    for (int i = 0; i < 4; i++) {
+        if (ctxs[i].rows > 10) all_stopped = 0;
+        total += ctxs[i].rows;
+    }
+    test_report("scanner_par_stop: threads stopped early", all_stopped);
+    test_report("scanner_par_stop: total < 400", total < 400);
+
+    clearprism_scan_close(s);
+    scan_cleanup();
+}
+
 /* ========== Runner ========== */
 
 int test_scanner_run(void)
@@ -468,6 +581,9 @@ int test_scanner_run(void)
     test_scanner_single_source();
     test_scanner_null_handling();
     test_scanner_source_id();
+    test_scanner_parallel();
+    test_scanner_parallel_column_access();
+    test_scanner_parallel_early_stop();
 
     return 0;
 }

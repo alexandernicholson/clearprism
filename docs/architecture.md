@@ -24,7 +24,7 @@ The extension registers a module named `"clearprism"` via `sqlite3_create_module
 2. Opens the registry database and loads the source list
 3. Introspects the schema from the first active source via `PRAGMA table_info` (or uses the `schema` override if provided)
 4. Declares the virtual table schema to SQLite (with `_source_db TEXT HIDDEN` and `_source_errors INTEGER HIDDEN` appended)
-5. Initializes the connection pool, L1 cache, and L2 cache (L2 is auto-enabled by default at `/tmp/clearprism_cache_{vtab}_{table}.db`; failures are non-fatal — logged as warnings; set `cache_db='none'` to disable)
+5. Initializes the connection pool, L1 cache, and L2 cache (L2 is auto-enabled by default at `/tmp/clearprism_cache_{vtab}_{table}.db`; initial populate runs asynchronously in a background thread so CREATE returns immediately; failures are non-fatal — logged as warnings; set `cache_db='none'` to disable)
 6. Logs any initialization warnings (unreachable sources, L2 failures)
 7. If `mode='snapshot'`, populates the snapshot shadow table (see [Snapshot Mode](#snapshot-mode))
 
@@ -287,7 +287,7 @@ Key differences from the vtab path:
 | ORDER BY | Merge-sort across sources | Per-source only |
 | SQL integration | Full (`SELECT`, `JOIN`, `GROUP BY`) | C API only |
 
-The scanner reuses the same registry and connection pool infrastructure as the vtab. Schema discovery uses the same `PRAGMA table_info` approach. Sources are iterated sequentially; failed sources are skipped (resilient).
+The scanner reuses the same registry infrastructure as the vtab. Schema discovery uses the same `PRAGMA table_info` approach. In sequential mode, sources are iterated one at a time via the connection pool; failed sources are skipped (resilient). In parallel mode (`clearprism_scan_parallel`), sources are distributed across worker threads using an atomic work-stealing counter — each thread opens its own direct connection, bypassing the pool entirely.
 
 ## WHERE Pushdown
 
@@ -423,13 +423,17 @@ Cache hit rates dominate real-world performance. For repeated query patterns (da
 
 The Scanner API bypasses the virtual table protocol, eliminating per-row VDBE dispatch overhead. Measured on the federation benchmark (100 sources × 1M rows each = 100M rows):
 
-| API | Time | vs Direct SQLite |
-|-----|------|-----------------|
-| Direct SQLite (manual 100-source loop) | 46.4s | baseline |
-| Clearprism Scanner | 50.6s | **1.09x** |
-| Clearprism Virtual Table | 98.2s | 2.12x |
+| API | Time | Rows/sec | vs Direct Sequential |
+|-----|------|----------|---------------------|
+| Direct SQLite sequential | 59.4s | 1.68M/s | baseline |
+| Direct SQLite 16 threads | 23.1s | 4.33M/s | 2.57x faster |
+| Clearprism Scanner (sequential) | 50.5s | 1.98M/s | 1.18x faster |
+| Clearprism Scanner (16 threads) | 18.5s | 5.39M/s | **3.21x faster** |
+| Clearprism Virtual Table | 145.5s | 687K/s | 2.45x slower |
 
-The ~2x vtab overhead is structural to the SQLite virtual table protocol (xEof + xNext + xColumn×N + xRowid = ~10 indirect calls per row × 100M rows). The scanner eliminates this by calling `sqlite3_step()` and `sqlite3_column_*()` directly.
+The ~2.45x vtab overhead is structural to the SQLite virtual table protocol (xEof + xNext + xColumn×N + xRowid = ~10 indirect calls per row × 100M rows). The sequential scanner eliminates this by calling `sqlite3_step()` and `sqlite3_column_*()` directly.
+
+The parallel scanner distributes sources across worker threads using work-stealing, achieving 5.39M rows/sec — 24% faster than even raw direct parallel reads. Each thread opens its own connection (bypassing the pool), calls a user-provided callback with the `sqlite3_stmt` positioned on the current row (zero-copy, no `sqlite3_value_dup()`), and advances to the next source atomically when done.
 
 ### Benchmarking
 

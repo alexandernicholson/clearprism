@@ -59,7 +59,7 @@ Expected output:
   PASS: admin_status
   ...
 
-=== Results: 268/268 passed ===
+=== Results: 286/286 passed ===
 ```
 
 ## Test Structure
@@ -74,7 +74,7 @@ All tests are in the `test/` directory:
 | `test_cache.c` | L1 + unified cache | Create/destroy, insert/lookup, LRU eviction, TTL expiry (2s sleep), unified cache facade |
 | `test_vtab.c` | End-to-end virtual table | Basic SELECT across 3 sources, `_source_db` filter, WHERE pushdown (LIKE, EQ, NE, GLOB, IS NULL, IS NOT NULL, IN), empty results, cache_db mode, composite rowids (stable + lookup), L1 cache population, OFFSET, ORDER BY (single/multi-source), combined queries, registry auto-reload, parallel drain, snapshot mode (basic, WHERE, source_db, rowid, limit/offset, ORDER BY, L1 cache, destroy) |
 | `test_agg.c` | Aggregate pushdown | COUNT, SUM, MIN, MAX, AVG, GROUP BY pushdown |
-| `test_scanner.c` | Scanner API | Full scan, column accessors, source alias/id, column metadata, WHERE filter/range, callback iteration, early stop, empty sources, single source, NULL handling |
+| `test_scanner.c` | Scanner API | Full scan, column accessors, source alias/id, column metadata, WHERE filter/range, callback iteration, early stop, empty sources, single source, NULL handling, parallel scan, parallel column access, parallel early stop |
 | `test_admin.c` | Admin functions & UX | Registry init, status JSON, cache flush, add source, reload registry, parameter validation, `_source_errors` column, schema override, cache hit/miss counters |
 
 ## Test Framework
@@ -199,6 +199,9 @@ users: (20, 'Frank', 'frank@north.com')
 | `test_scanner_single_source` | Scanner with 1 source returns correct rows |
 | `test_scanner_null_handling` | `scan_is_null()` correctly detects NULL values |
 | `test_scanner_source_id` | `scan_source_id()` returns numeric source IDs from the registry |
+| `test_scanner_parallel` | Parallel scan across 4 sources × 100 rows, verifies 400 total, scanner EOF after |
+| `test_scanner_parallel_column_access` | Parallel scan verifies zero-copy column access works across threads |
+| `test_scanner_parallel_early_stop` | Parallel scan stops early when callback returns non-zero |
 
 The scanner tests create a fresh registry + source databases in `/tmp` with a schema of `items (id INTEGER PRIMARY KEY, category TEXT, name TEXT, value REAL)`.
 

@@ -76,7 +76,7 @@ flowchart TD
 
 ## L2: Shadow Table Cache
 
-The L2 cache materializes a copy of all source data into a local SQLite database. It is optional — only enabled when `cache_db` is specified.
+The L2 cache materializes a copy of all source data into a local SQLite database. It is auto-enabled by default (at `/tmp/clearprism_cache_{vtab}_{table}.db`); set `cache_db='none'` to disable. The initial populate runs asynchronously in a background thread, so `CREATE VIRTUAL TABLE` returns immediately and the first query serves from sources directly.
 
 ### Shadow Table Schema
 
@@ -126,26 +126,32 @@ flowchart TD
     CHECK -- YES --> REFRESH["Full refresh cycle"]
     REFRESH --> SLEEP
 
-    subgraph REFRESH_CYCLE["Refresh Cycle"]
+    subgraph REFRESH_CYCLE["Refresh Cycle (Incremental)"]
         direction TB
-        SNAP["Get source snapshot<br>from registry"] --> BEGIN["BEGIN IMMEDIATE"]
-        BEGIN --> DEL["DELETE FROM shadow_table"]
-        DEL --> LOOP["For each source:"]
-        LOOP --> OPEN["Open source DB<br>(dedicated connection)"]
-        OPEN --> COPY["SELECT * FROM source<br>INSERT INTO shadow"]
-        COPY --> CLOSE["Close source connection"]
-        CLOSE --> NEXT{"More<br>sources?"}
+        SNAP["Get source snapshot<br>from registry"] --> MTIME["Check mtimes of<br>all source files"]
+        MTIME --> CHANGED{"Any sources<br>changed?"}
+        CHANGED -- NO --> DONE["Skip refresh"]
+        CHANGED -- YES --> LOOP["For each changed source:"]
+        LOOP --> DEL["DELETE WHERE<br>_cp_source_alias = ?"]
+        DEL --> OPEN["Open source DB<br>(streaming connection)"]
+        OPEN --> STREAM["SELECT * → INSERT<br>(row-by-row, O(1) memory)"]
+        STREAM --> COMMIT_SRC["COMMIT per source"]
+        COMMIT_SRC --> NEXT{"More<br>changed?"}
         NEXT -- YES --> LOOP
-        NEXT -- NO --> META["Update _clearprism_meta"]
-        META --> COMMIT["COMMIT"]
+        NEXT -- NO --> PRUNE["Prune removed sources"]
+        PRUNE --> META["Update _clearprism_meta"]
     end
 ```
 
 Key details:
+- **Streaming refresh**: Rows are read from each source and inserted directly into the shadow table one at a time — O(1) memory regardless of dataset size. No buffering or `sqlite3_value_dup()` overhead.
+- **Incremental**: Only sources whose file mtime has changed since the last refresh are re-read. Unchanged sources are skipped entirely.
+- **Per-source commits**: Each changed source is refreshed in its own transaction (DELETE old rows + INSERT new rows + COMMIT), so partial failures don't roll back other sources.
+- **Async initial populate**: The first refresh runs in the background thread immediately after `CREATE VIRTUAL TABLE`. The first query serves from sources directly; subsequent queries benefit from the cache.
 - The refresh thread opens its own dedicated connections to source databases (not from the shared pool) to avoid thread safety issues
 - Each source is processed independently — if one source fails, the others still get refreshed
 - The `running` flag is checked between each source to allow clean shutdown
-- The entire refresh is wrapped in a single transaction on the writer connection
+- Removed sources are pruned (rows deleted from shadow table) at the end of each refresh cycle
 
 ### Freshness Check
 
@@ -161,5 +167,4 @@ L2 is considered "fresh" if `(now - last_refresh) < refresh_interval_sec`. When 
 
 ### Current Limitations
 
-- L2 refreshes do a full DELETE + INSERT per cycle, not incremental updates
 - L2 query-time lookups parse the cache key to extract a source alias for filtering; queries without a source constraint search the entire shadow table

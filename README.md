@@ -16,7 +16,8 @@ graph LR
     subgraph WITH["With Clearprism"]
         direction TB
         A2["Your Code"] -->|"one query"| CP["Clearprism"]
-        CP -->|"cache hit"| CACHE["L1 Cache<br>(in-memory)"]
+        CP -->|"cache hit"| L1["L1 Cache<br>(in-memory)"]
+        CP -->|"L1 miss"| L2["L2 Cache<br>(disk, async)"]
         CP -->|"cache miss"| S1["customers_east.db"]
         CP -->|"auto"| S2["customers_west.db"]
         CP -->|"auto"| S3["customers_north.db"]
@@ -32,12 +33,21 @@ graph LR
 
 Benchmarked against manually querying 100 SQLite databases (100M rows total):
 
-| Scenario | Do It Yourself | Clearprism | Speedup |
-|----------|----------------|------------|---------|
-| Point lookup across 100 DBs | 29.9ms | **58us** | **515x faster** |
-| Filtered scan (~1% selectivity) | 81.5s | **567ms** | **144x faster** |
-| Full table scan (100M rows) | 47s | **23.5s** | **2x faster** |
-| Concurrent reads (16 threads) | you build it | **6M rows/s** | built-in |
+| Scenario | Do It Yourself | Clearprism (SQL) | Speedup |
+|----------|----------------|------------------|---------|
+| Point lookup across 100 DBs | 2.21ms | **59us** | **37x faster** |
+| Filtered scan (~1% selectivity) | 50.4s | **553ms** | **91x faster** |
+| Full scan (100M rows, first query) | 59.4s | 145s | see below |
+| Full scan (100M rows, cached) | 59.4s | **553ms** | **107x faster** |
+
+The first full scan of 100M rows through SQL is slower than direct SQLite (145s vs 59s). This is inherent to SQLite's [virtual table protocol](https://www.sqlite.org/vtab.html) — each row requires ~10 indirect function calls (xEof, xNext, xColumn per column, xRowid) that add up across 100M rows. This overhead only matters for uncached full scans of very large datasets. For filtered queries, point lookups, and any repeated query, the L1/L2 cache eliminates source I/O entirely.
+
+For C applications that need raw full-scan throughput (ETL, bulk export, analytics), the [Scanner API](#streaming-scanner-api) bypasses the virtual table protocol:
+
+| Scenario | Direct SQLite | Scanner API |
+|----------|---------------|-------------|
+| Full scan, sequential | 59.4s (1.68M rows/s) | 50.5s (1.98M rows/s) |
+| Full scan, 16 threads | 23.1s (4.33M rows/s) | **18.5s (5.39M rows/s)** |
 
 ```sql
 -- Load the extension
@@ -56,18 +66,21 @@ SELECT name, email, _source_db FROM all_users WHERE email LIKE '%@example.com';
 SELECT * FROM all_users WHERE _source_db = 'west_region';
 ```
 
-For best performance, use **snapshot mode** to materialize all source data locally at creation time. Repeated queries read from the snapshot with no per-query source I/O, and the same L1 cache applies — the first query populates the cache, subsequent identical queries serve from memory:
+Caching is automatic — an L2 disk cache populates in the background as soon as the table is created. The first query reads from sources directly; subsequent queries serve from cache with no source I/O. For datasets that never change, use **snapshot mode** to materialize all data at creation time:
 
 ```sql
+-- Default: L2 cache auto-populates in the background
+CREATE VIRTUAL TABLE all_users USING clearprism(
+    registry_db='/path/to/registry.db',
+    table='users'
+);
+
+-- Snapshot mode: materialize everything at creation, no background refresh
 CREATE VIRTUAL TABLE all_users USING clearprism(
     registry_db='/path/to/registry.db',
     table='users',
     mode='snapshot'
 );
-
--- Fast: reads from local shadow table, not source databases
-SELECT COUNT(*) FROM all_users;
-SELECT * FROM all_users WHERE email LIKE '%@example.com';
 ```
 
 ## Features
@@ -81,8 +94,9 @@ SELECT * FROM all_users WHERE email LIKE '%@example.com';
 - **Stable composite rowids** encoding `(source_id << 40) | source_rowid` for efficient `WHERE rowid = ?` lookups
 - **IN pushdown** expands `WHERE col IN (...)` into parameterized queries on each source (SQLite 3.38.0+)
 - **REGEXP/MATCH fallback** pushes these operators to sources that support them, falls back to SQLite post-filtering otherwise
-- **Two-tier caching** with in-memory LRU (L1) and disk-based shadow tables (L2)
+- **Two-tier caching** with in-memory LRU (L1) and disk-based shadow tables (L2, async background populate)
 - **Connection pooling** with lazy opening and LRU eviction
+- **Parallel scanner** with zero-copy push-based callbacks for maximum throughput (5.4M rows/sec)
 - **Registry auto-reload** detects source list changes without restarting
 - **Resilient** — skips unavailable sources instead of failing the entire query
 - **Thread-safe** with per-component locking and a strict lock hierarchy
@@ -243,7 +257,7 @@ clearprism/
 
 ## Streaming Scanner API
 
-For C applications that need maximum throughput over very large datasets (100M+ rows), the Scanner API bypasses the virtual table protocol entirely for ~1.09x direct SQLite speed:
+For C applications doing bulk reads (ETL, analytics, exports) over very large datasets, the Scanner API bypasses the virtual table protocol entirely. It calls `sqlite3_step()` and `sqlite3_column_*()` directly — no per-row function dispatch overhead. Sequential mode matches direct SQLite speed; parallel mode with work-stealing across threads exceeds it.
 
 ```c
 clearprism_scanner *sc = clearprism_scan_open("registry.db", "users");
@@ -257,6 +271,22 @@ while (clearprism_scan_next(sc)) {
     printf("%s: %s (from %s)\n", name, email, clearprism_scan_source_alias(sc));
 }
 
+clearprism_scan_close(sc);
+```
+
+For even higher throughput, use the parallel scanner to distribute sources across worker threads with zero-copy callbacks:
+
+```c
+int my_callback(sqlite3_stmt *stmt, int n_cols, const char *source_alias,
+                int thread_id, void *ctx) {
+    int64_t *counts = (int64_t *)ctx;
+    counts[thread_id]++;
+    return 0;  // 0 = continue, non-zero = stop
+}
+
+clearprism_scanner *sc = clearprism_scan_open("registry.db", "users");
+int64_t counts[16] = {0};
+clearprism_scan_parallel(sc, 16, my_callback, counts);
 clearprism_scan_close(sc);
 ```
 

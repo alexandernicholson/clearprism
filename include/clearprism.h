@@ -626,4 +626,26 @@ int  clearprism_scan_each(clearprism_scanner *s,
                            int (*callback)(clearprism_scanner *s, void *ctx),
                            void *ctx);
 
+/* Parallel scan callback. Called once per row, from a worker thread.
+ * Column i (0-indexed) is at sqlite3_column_*(stmt, i + CLEARPRISM_COL_OFFSET).
+ * Column 0 in stmt = rowid.
+ * Return 0 to continue, non-zero to stop this thread's iteration. */
+typedef int (*clearprism_scan_row_fn)(
+    sqlite3_stmt *stmt,
+    int n_cols,
+    const char *source_alias,
+    int thread_id,
+    void *user_ctx
+);
+
+/* Parallel scan: distributes sources across n_threads worker threads.
+ * Each thread opens its own connection, prepares the query, iterates rows,
+ * and calls row_cb for each row.  Zero-copy column access — no
+ * sqlite3_value_dup() overhead.
+ * Must be called before first scan_next() (scanner must not have started).
+ * Returns SQLITE_OK on success. */
+int  clearprism_scan_parallel(clearprism_scanner *s, int n_threads,
+                               clearprism_scan_row_fn row_cb,
+                               void *user_ctx);
+
 #endif /* CLEARPRISM_H */

@@ -468,11 +468,8 @@ static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr)
             sqlite3_free(l2_err);
         } else {
             vtab->l2_active = 1;
-            /* Synchronous initial populate — ensures L2 is ready for first query */
-            char *pop_err = NULL;
-            clearprism_l2_populate(l2, &pop_err);
-            sqlite3_free(pop_err);
-            /* Start background refresh thread for periodic updates */
+            /* Start background refresh thread — initial populate runs async,
+             * first query serves from sources directly */
             char *start_err = NULL;
             clearprism_l2_start_refresh(l2, &start_err);
             sqlite3_free(start_err);

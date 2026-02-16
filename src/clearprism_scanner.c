@@ -557,3 +557,150 @@ int clearprism_scan_each(clearprism_scanner *s,
     }
     return SQLITE_OK;
 }
+
+/* ========== Parallel scan ========== */
+
+/* Shared context for work-stealing parallel scan */
+typedef struct {
+    clearprism_source *sources;
+    int n_sources;
+    int next_source;                /* atomic counter */
+    const char *sql;
+    clearprism_scan_bind *binds;
+    int n_binds;
+    int n_cols;
+    clearprism_scan_row_fn row_cb;
+    void *user_ctx;
+} scanner_par_ctx;
+
+/* Per-thread state */
+typedef struct {
+    scanner_par_ctx *ctx;
+    int thread_id;
+} scanner_par_worker;
+
+static void *scanner_par_thread(void *arg)
+{
+    scanner_par_worker *w = (scanner_par_worker *)arg;
+    scanner_par_ctx *ctx = w->ctx;
+
+    while (1) {
+        int idx = __sync_fetch_and_add(&ctx->next_source, 1);
+        if (idx >= ctx->n_sources) break;
+
+        /* Open connection directly (no pool — avoids contention) */
+        sqlite3 *db = NULL;
+        int rc = sqlite3_open_v2(ctx->sources[idx].path, &db,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                                 NULL);
+        if (rc != SQLITE_OK) {
+            sqlite3_close(db);
+            continue;
+        }
+
+        /* Prepare statement */
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db, ctx->sql, -1, &stmt, NULL);
+        if (rc != SQLITE_OK) {
+            sqlite3_close(db);
+            continue;
+        }
+
+        /* Bind parameters */
+        for (int i = 0; i < ctx->n_binds; i++) {
+            clearprism_scan_bind *b = &ctx->binds[i];
+            switch (b->type) {
+            case SQLITE_INTEGER:
+                sqlite3_bind_int64(stmt, i + 1, b->u.i);
+                break;
+            case SQLITE_FLOAT:
+                sqlite3_bind_double(stmt, i + 1, b->u.d);
+                break;
+            case SQLITE_TEXT:
+                sqlite3_bind_text(stmt, i + 1, b->text, b->text_len,
+                                  SQLITE_STATIC);
+                break;
+            default:
+                sqlite3_bind_null(stmt, i + 1);
+                break;
+            }
+        }
+
+        /* Iterate rows, calling callback for each */
+        int stopped = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            rc = ctx->row_cb(stmt, ctx->n_cols,
+                             ctx->sources[idx].alias,
+                             w->thread_id, ctx->user_ctx);
+            if (rc != 0) { stopped = 1; break; }
+        }
+
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        if (stopped) break;
+    }
+
+    return NULL;
+}
+
+int clearprism_scan_parallel(clearprism_scanner *s, int n_threads,
+                              clearprism_scan_row_fn row_cb,
+                              void *user_ctx)
+{
+    if (!s || !row_cb) return SQLITE_MISUSE;
+    if (s->started) return SQLITE_MISUSE;  /* must call before scan_next */
+
+    /* Clamp thread count */
+    if (n_threads > s->n_sources) n_threads = s->n_sources;
+    if (n_threads < 1) n_threads = 1;
+
+    /* Build shared context */
+    scanner_par_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.sources = s->sources;
+    ctx.n_sources = s->n_sources;
+    ctx.next_source = 0;
+    ctx.sql = s->filter_sql ? s->filter_sql : s->base_sql;
+    ctx.binds = s->binds;
+    ctx.n_binds = s->n_binds;
+    ctx.n_cols = s->n_cols;
+    ctx.row_cb = row_cb;
+    ctx.user_ctx = user_ctx;
+
+    /* Create per-thread workers */
+    scanner_par_worker *workers = sqlite3_malloc(
+        n_threads * (int)sizeof(scanner_par_worker));
+    if (!workers) return SQLITE_NOMEM;
+
+    pthread_t *threads = sqlite3_malloc(
+        n_threads * (int)sizeof(pthread_t));
+    if (!threads) {
+        sqlite3_free(workers);
+        return SQLITE_NOMEM;
+    }
+
+    /* Launch threads with reduced stack size */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+
+    for (int i = 0; i < n_threads; i++) {
+        workers[i].ctx = &ctx;
+        workers[i].thread_id = i;
+        pthread_create(&threads[i], &attr, scanner_par_thread, &workers[i]);
+    }
+    pthread_attr_destroy(&attr);
+
+    /* Wait for all threads */
+    for (int i = 0; i < n_threads; i++)
+        pthread_join(threads[i], NULL);
+
+    sqlite3_free(threads);
+    sqlite3_free(workers);
+
+    /* Mark scanner as consumed */
+    s->started = 1;
+    s->eof = 1;
+
+    return SQLITE_OK;
+}

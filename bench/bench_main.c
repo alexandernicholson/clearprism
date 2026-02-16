@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <sqlite3.h>
 #include "clearprism.h"
 
@@ -1090,6 +1091,21 @@ static void fed_row(const char *label, double wall_us, int64_t rows,
     csv_append(scenario, config, &s);
 }
 
+/* Parallel scanner callback: touch every column, count rows per thread */
+struct fed_scan_par_ctx { int64_t rows; };
+
+static int fed_scan_par_cb(sqlite3_stmt *stmt, int n_cols,
+                            const char *source_alias, int thread_id,
+                            void *user_ctx)
+{
+    (void)source_alias;
+    struct fed_scan_par_ctx *ctxs = (struct fed_scan_par_ctx *)user_ctx;
+    for (int c = 0; c < n_cols; c++)
+        sqlite3_column_type(stmt, c + CLEARPRISM_COL_OFFSET);
+    ctxs[thread_id].rows++;
+    return 0;
+}
+
 static void bench_scenario_federation(void)
 {
     const int n_dbs = FED_N_DBS;
@@ -1241,6 +1257,28 @@ static void bench_scenario_federation(void)
             clearprism_scan_close(sc);
             fed_row("clearprism_scanner", wall, rows,
                     "federation_full", "clearprism_scanner");
+        }
+
+        /* Clearprism Scanner Parallel (zero-copy, multi-threaded) */
+        {
+            clearprism_scanner *sc = clearprism_scan_open(reg_path, "items");
+            struct fed_scan_par_ctx pctx[FED_N_THREADS];
+            memset(pctx, 0, sizeof(pctx));
+
+            double t0 = bench_now_us();
+            clearprism_scan_parallel(sc, FED_N_THREADS,
+                fed_scan_par_cb, pctx);
+            double wall = bench_now_us() - t0;
+
+            int64_t rows = 0;
+            for (int i = 0; i < FED_N_THREADS; i++) rows += pctx[i].rows;
+            clearprism_scan_close(sc);
+
+            char label[32];
+            snprintf(label, sizeof(label), "scanner_%d_threads",
+                     FED_N_THREADS);
+            fed_row(label, wall, rows,
+                    "federation_full", label);
         }
     }
 
@@ -1789,6 +1827,14 @@ static void bench_scenario_snapshot(void)
 int main(int argc, char **argv)
 {
     const char *selected = argc > 1 ? argv[1] : NULL;
+
+    /* Cap virtual memory at 8 GB to prevent OOM crashes */
+    {
+        struct rlimit rl;
+        rl.rlim_cur = (rlim_t)8ULL * 1024 * 1024 * 1024;
+        rl.rlim_max = (rlim_t)8ULL * 1024 * 1024 * 1024;
+        setrlimit(RLIMIT_AS, &rl);
+    }
 
     printf("=== Clearprism Benchmark Suite ===\n");
     printf("Version: %s\n", CLEARPRISM_VERSION_STRING);

@@ -465,6 +465,40 @@ Callback-driven iteration. Calls `callback` for each row. If the callback return
 
 **Returns**: `SQLITE_OK` if all rows were consumed, or the callback's non-zero return value.
 
+### clearprism_scan_row_fn (callback type)
+
+```c
+typedef int (*clearprism_scan_row_fn)(
+    sqlite3_stmt *stmt,
+    int n_cols,
+    const char *source_alias,
+    int thread_id,
+    void *user_ctx
+);
+```
+
+Callback type for `clearprism_scan_parallel()`. Called once per row from a worker thread. The `stmt` is positioned on the current row — access columns via `sqlite3_column_*(stmt, col + CLEARPRISM_COL_OFFSET)` (column 0 in the statement is the rowid).
+
+Return 0 to continue iteration, non-zero to stop the calling thread's iteration.
+
+**Thread safety**: The callback may be called concurrently from multiple threads. The `thread_id` parameter (0 to n_threads-1) can be used to index into per-thread state without synchronization.
+
+### clearprism_scan_parallel
+
+```c
+int clearprism_scan_parallel(clearprism_scanner *s, int n_threads,
+                              clearprism_scan_row_fn row_cb,
+                              void *user_ctx);
+```
+
+Parallel scan: distributes sources across `n_threads` worker threads using work-stealing. Each worker opens its own database connection (not from the pool), prepares the query, iterates rows, and calls `row_cb` for each row. Zero-copy — column data is accessed directly from the `sqlite3_stmt` with no `sqlite3_value_dup()` overhead.
+
+Must be called before the first `clearprism_scan_next()` — the scanner must not have started sequential iteration. After completion, the scanner is marked as consumed (EOF).
+
+The number of threads is clamped to `min(n_threads, n_sources)`. Each thread uses a 256KB stack.
+
+**Returns**: `SQLITE_OK` on success, `SQLITE_MISUSE` if the scanner has already started.
+
 ## Admin Functions
 
 Clearprism registers five SQL scalar functions for runtime diagnostics and management. These are available after loading the extension (or calling `clearprism_init`).
