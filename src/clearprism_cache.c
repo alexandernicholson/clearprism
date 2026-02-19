@@ -65,8 +65,9 @@ int clearprism_cache_lookup(clearprism_cache *cache, const char *key,
         }
     }
 
-    /* Try L2 (if fresh) */
-    if (cache->l2 && clearprism_l2_is_fresh(cache->l2)) {
+    /* Try L2 — only if initial populate already finished (non-blocking) */
+    if (cache->l2 && clearprism_l2_is_ready(cache->l2) &&
+        clearprism_l2_is_fresh(cache->l2)) {
         /* Parse cache key to extract source alias for L2 filtering.
            Key format: "table:src=alias:p0=val:..." */
         const char *source_alias = NULL;
@@ -83,8 +84,10 @@ int clearprism_cache_lookup(clearprism_cache *cache, const char *key,
         }
 
         char *l2_err = NULL;
-        sqlite3_stmt *l2_stmt = clearprism_l2_query(cache->l2, NULL,
-                                                       source_alias, &l2_err);
+        sqlite3 *l2_db = NULL;
+        sqlite3_stmt *l2_stmt = clearprism_l2_query_ex(cache->l2, NULL,
+                                                        source_alias, &l2_err,
+                                                        &l2_db);
         sqlite3_free(l2_err);
 
         if (l2_stmt) {
@@ -95,12 +98,14 @@ int clearprism_cache_lookup(clearprism_cache *cache, const char *key,
                 if (cc) {
                     memset(cc, 0, sizeof(*cc));
                     cc->l2_stmt = l2_stmt;
+                    cc->l2_db = l2_db;
                     *out_cursor = cc;
                     return 1;
                 }
             }
             /* No rows or alloc failed */
             sqlite3_finalize(l2_stmt);
+            if (l2_db) sqlite3_close(l2_db);
         }
     }
 
@@ -124,6 +129,9 @@ void clearprism_cache_cursor_free(clearprism_cache_cursor *cc)
     if (cc->l2_stmt) {
         sqlite3_finalize(cc->l2_stmt);
     }
+    if (cc->l2_db) {
+        sqlite3_close(cc->l2_db);
+    }
     /* Note: L1 rows are owned by the L1 entry, not the cursor.
        We don't free them here. */
     sqlite3_free(cc);
@@ -137,7 +145,7 @@ int clearprism_cache_cursor_next(clearprism_cache_cursor *cc)
     if (cc->l2_stmt) {
         int rc = sqlite3_step(cc->l2_stmt);
         if (rc != SQLITE_ROW) {
-            return SQLITE_DONE;
+            cc->l2_eof = 1;
         }
         return SQLITE_OK;
     }
@@ -156,7 +164,7 @@ int clearprism_cache_cursor_eof(clearprism_cache_cursor *cc)
 
     /* L2 path */
     if (cc->l2_stmt) {
-        return 0;  /* We rely on next() returning DONE */
+        return cc->l2_eof;
     }
 
     /* L1 path — flat array bounds check */

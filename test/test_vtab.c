@@ -1240,6 +1240,11 @@ static void drain_cleanup_test_files(void)
         snprintf(path, sizeof(path), "/tmp/clearprism_drain_test_src%d.db", i);
         unlink(path);
     }
+    /* Clean up auto-generated L2 cache */
+    unlink("/tmp/clearprism_cache_items_items.db");
+    unlink("/tmp/clearprism_cache_items_items.db-wal");
+    unlink("/tmp/clearprism_cache_items_items.db-shm");
+    unlink("/tmp/clearprism_cache_items_items.db-journal");
 }
 
 static void drain_setup(int n_sources, int rows_per_source)

@@ -66,7 +66,7 @@ SELECT name, email, _source_db FROM all_users WHERE email LIKE '%@example.com';
 SELECT * FROM all_users WHERE _source_db = 'west_region';
 ```
 
-Caching is automatic — an L2 disk cache populates in the background as soon as the table is created. The first query reads from sources directly; subsequent queries serve from cache with no source I/O. For datasets that never change, use **snapshot mode** to materialize all data at creation time:
+Caching is automatic — an L2 disk cache populates in the background as soon as the table is created. Once the background populate finishes, simple queries (full scans without ORDER BY/LIMIT) serve directly from the shadow table, avoiding the slow vtab protocol path entirely. If the populate is still in progress, queries use the live path without blocking. Queries with ORDER BY, LIMIT, or OFFSET always use the live path for correct handling, and their results populate the L1 in-memory cache. For datasets that never change, use **snapshot mode** to materialize all data at creation time:
 
 ```sql
 -- Default: L2 cache auto-populates in the background

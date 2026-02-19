@@ -202,6 +202,8 @@ struct clearprism_l2_cache {
     int      running;            /* flag for background thread */
     pthread_t refresh_thread;
     pthread_mutex_t lock;
+    pthread_cond_t  populate_done_cond;    /* signaled after first refresh */
+    int             initial_populate_done; /* 0 until first l2_do_refresh done */
     /* Back-reference for source enumeration during refresh */
     clearprism_registry *registry;
     clearprism_connpool *pool;
@@ -262,6 +264,8 @@ struct clearprism_cache_cursor {
     int64_t current_rowid;          /* composite rowid of current L1 row */
     /* L2 cursor */
     sqlite3_stmt *l2_stmt;
+    sqlite3      *l2_db;            /* per-query connection (closed on free) */
+    int           l2_eof;           /* 1 when L2 statement exhausted */
 };
 
 /* ---------- Virtual table ---------- */
@@ -495,7 +499,14 @@ sqlite3_stmt *clearprism_l2_query(clearprism_l2_cache *l2,
                                    const char *where_clause,
                                    const char *source_alias,
                                    char **errmsg);
+sqlite3_stmt *clearprism_l2_query_ex(clearprism_l2_cache *l2,
+                                      const char *where_clause,
+                                      const char *source_alias,
+                                      char **errmsg,
+                                      sqlite3 **out_db);
 int  clearprism_l2_is_fresh(clearprism_l2_cache *l2);
+void clearprism_l2_wait_ready(clearprism_l2_cache *l2);
+int  clearprism_l2_is_ready(clearprism_l2_cache *l2);
 
 /* clearprism_cache.c */
 clearprism_cache *clearprism_cache_create(clearprism_l1_cache *l1,
