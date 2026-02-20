@@ -85,5 +85,8 @@ $(BENCH_TARGET): $(SRCS_TEST_OBJS) $(BENCH_OBJS)
 bench: $(BENCH_TARGET)
 	./$(BENCH_TARGET)
 
+bench-quick: $(BENCH_TARGET)
+	./$(BENCH_TARGET) quick
+
 clean:
 	rm -f src/*.o src/*-test.o test/*.o bench/*.o $(TARGET) $(TEST_TARGET) $(BENCH_TARGET)
