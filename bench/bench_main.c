@@ -1,8 +1,9 @@
 /*
  * bench_main.c — Clearprism read performance benchmark
  *
- * Usage: ./clearprism_bench [scenario_name]
- *   No args = run all scenarios (~50s)
+ * Usage: ./clearprism_bench [scenario_name | quick]
+ *   No args = run all scenarios (full size)
+ *   quick   = run all scenarios with reduced data sizes (<2 min)
  *   Scenario names: baseline, source_scale, cache, where, orderby, row_scale, concurrent, federation, drain, agg_pushdown, snapshot, multi_query
  */
 
@@ -28,6 +29,10 @@ extern int clearprism_init(sqlite3 *db);
 #define BENCH_WARMUP   3
 #define BENCH_TMP_DIR  "/tmp/clearprism_bench"
 #define BENCH_CSV_FILE "bench_results.csv"
+
+/* Quick mode — set at runtime via ./clearprism_bench quick */
+static int bench_quick_mode = 0;
+#define QUICK(normal, quick) (bench_quick_mode ? (quick) : (normal))
 
 /* ========== Fast LCG PRNG ========== */
 
@@ -360,7 +365,7 @@ static void bench_scenario_baseline(void)
         int64_t rows = 0;
         sqlite3 *db;
         sqlite3_open_v2(src_path, &db, SQLITE_OPEN_READONLY, NULL);
-        bench_run_query(db, "SELECT * FROM items", BENCH_WARMUP, 100, &t, &rows);
+        bench_run_query(db, "SELECT * FROM items", BENCH_WARMUP, QUICK(100, 30), &t, &rows);
         sqlite3_close(db);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("direct_sqlite", &s);
@@ -373,7 +378,7 @@ static void bench_scenario_baseline(void)
         bench_timer t; timer_init(&t, 200);
         int64_t rows = 0;
         sqlite3 *db = bench_open_vtab(reg_path);
-        bench_run_query(db, "SELECT * FROM bench_items", BENCH_WARMUP, 100, &t, &rows);
+        bench_run_query(db, "SELECT * FROM bench_items", BENCH_WARMUP, QUICK(100, 30), &t, &rows);
         sqlite3_exec(db, "DROP TABLE bench_items", NULL, NULL, NULL);
         sqlite3_close(db);
         bench_stats s; timer_compute(&t, rows, &s);
@@ -389,7 +394,7 @@ static void bench_scenario_baseline(void)
         sqlite3 *db;
         sqlite3_open_v2(src_path, &db, SQLITE_OPEN_READONLY, NULL);
         bench_run_query(db, "SELECT * FROM items WHERE category = 'cat_042'",
-                        BENCH_WARMUP, 100, &t, &rows);
+                        BENCH_WARMUP, QUICK(100, 30), &t, &rows);
         sqlite3_close(db);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("direct_filtered", &s);
@@ -404,7 +409,7 @@ static void bench_scenario_baseline(void)
         sqlite3 *db = bench_open_vtab(reg_path);
         bench_run_query(db,
             "SELECT * FROM bench_items WHERE category = 'cat_042'",
-            BENCH_WARMUP, 100, &t, &rows);
+            BENCH_WARMUP, QUICK(100, 30), &t, &rows);
         sqlite3_exec(db, "DROP TABLE bench_items", NULL, NULL, NULL);
         sqlite3_close(db);
         bench_stats s; timer_compute(&t, rows, &s);
@@ -454,7 +459,7 @@ static void bench_scenario_baseline(void)
                 }
             }
             /* Measured */
-            for (int i = 0; i < 100; i++) {
+            for (int i = 0; i < QUICK(100, 30); i++) {
                 double t0 = bench_now_us();
                 int64_t rows = 0;
                 for (int s = 0; s < n_src; s++) {
@@ -495,7 +500,7 @@ static void bench_scenario_baseline(void)
             sqlite3_free(sql);
             bench_run_query(db,
                 "SELECT * FROM ms_items WHERE category = 'cat_042'",
-                BENCH_WARMUP, 100, &t, &rows);
+                BENCH_WARMUP, QUICK(100, 30), &t, &rows);
             sqlite3_exec(db, "DROP TABLE ms_items", NULL, NULL, NULL);
             sqlite3_close(db);
             bench_stats s; timer_compute(&t, rows, &s);
@@ -515,7 +520,7 @@ static void bench_scenario_source_scale(void)
     printf("\n--- Source Scaling (10K rows total) ---\n");
 
     int configs[] = {1, 5, 10, 25, 50};
-    int iters[]   = {50, 30, 20, 10, 5};
+    int iters[]   = {QUICK(50,15), QUICK(30,10), QUICK(20,8), QUICK(10,5), QUICK(5,3)};
     int n_configs = sizeof(configs) / sizeof(configs[0]);
 
     print_header();
@@ -592,7 +597,7 @@ static void bench_scenario_cache(void)
     {
         bench_timer t; timer_init(&t, 200);
         int64_t total_rows = 0;
-        for (int i = 0; i < 50; i++) {
+        for (int i = 0; i < QUICK(50, 15); i++) {
             sqlite3 *db = bench_open_vtab(reg_path);
             sqlite3_stmt *stmt;
             sqlite3_prepare_v2(db, "SELECT * FROM bench_items WHERE category = 'cat_042'",
@@ -623,7 +628,7 @@ static void bench_scenario_cache(void)
         int64_t rows = 0;
         sqlite3 *db = bench_open_vtab(reg_path);
         bench_run_query(db, "SELECT * FROM bench_items WHERE category = 'cat_042'",
-                        1, 100, &t, &rows);
+                        1, QUICK(100, 30), &t, &rows);
         sqlite3_exec(db, "DROP TABLE bench_items", NULL, NULL, NULL);
         sqlite3_close(db);
         bench_stats s; timer_compute(&t, rows, &s);
@@ -645,7 +650,7 @@ static void bench_scenario_cache(void)
         sqlite3_exec(db, create_sql, NULL, NULL, NULL);
         sqlite3_free(create_sql);
 
-        for (int round = 0; round < 5; round++) {
+        for (int round = 0; round < QUICK(5, 2); round++) {
             for (int q = 0; q < 20; q++) {
                 char sql[128];
                 snprintf(sql, sizeof(sql),
@@ -714,7 +719,7 @@ static void bench_scenario_where(void)
     for (int q = 0; q < n_queries; q++) {
         bench_timer t; timer_init(&t, 100);
         int64_t rows = 0;
-        bench_run_query(db, queries[q].sql, BENCH_WARMUP, 50, &t, &rows);
+        bench_run_query(db, queries[q].sql, BENCH_WARMUP, QUICK(50, 15), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row(queries[q].label, &s);
         csv_append("where", queries[q].label, &s);
@@ -768,7 +773,7 @@ static void bench_scenario_orderby(void)
     for (int q = 0; q < n_queries; q++) {
         bench_timer t; timer_init(&t, 100);
         int64_t rows = 0;
-        bench_run_query(db, queries[q].sql, BENCH_WARMUP, 50, &t, &rows);
+        bench_run_query(db, queries[q].sql, BENCH_WARMUP, QUICK(50, 15), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row(queries[q].label, &s);
         csv_append("orderby", queries[q].label, &s);
@@ -788,13 +793,19 @@ static void bench_scenario_row_scale(void)
 {
     printf("\n--- Row Count Scaling (1 source) ---\n");
 
-    struct { int rows; int iters; } configs[] = {
+    struct { int rows; int iters; } all_configs[] = {
         {1000,   200},
         {10000,  50},
         {100000, 10},
         {500000, 3},
     };
-    int n_configs = sizeof(configs) / sizeof(configs[0]);
+    struct { int rows; int iters; } quick_configs[] = {
+        {1000,   60},
+        {10000,  15},
+        {100000, 5},
+    };
+    struct { int rows; int iters; } *configs = bench_quick_mode ? quick_configs : all_configs;
+    int n_configs = bench_quick_mode ? 3 : 4;
 
     print_header();
 
@@ -902,9 +913,9 @@ static void bench_scenario_concurrent(void)
         for (int i = 0; i < n_threads; i++) {
             ctxs[i].reg_path = reg_path;
             ctxs[i].query = "SELECT * FROM bench_items WHERE category = 'cat_042'";
-            ctxs[i].duration_ms = 2000;
+            ctxs[i].duration_ms = QUICK(2000, 500);
             ctxs[i].thread_id = i;
-            timer_init(&ctxs[i].timer, 2000);
+            timer_init(&ctxs[i].timer, QUICK(2000, 500));
         }
 
         for (int i = 0; i < n_threads; i++)
@@ -1108,13 +1119,17 @@ static int fed_scan_par_cb(sqlite3_stmt *stmt, int n_cols,
 
 static void bench_scenario_federation(void)
 {
-    const int n_dbs = FED_N_DBS;
-    const int rows_per = FED_ROWS_PER_DB;
+    const int n_dbs = bench_quick_mode ? 20 : FED_N_DBS;
+    const int rows_per = bench_quick_mode ? 100000 : FED_ROWS_PER_DB;
     const int n_threads = FED_N_THREADS;
     int64_t total_expected = (int64_t)n_dbs * rows_per;
 
-    printf("\n=== Federation Showdown (%d DBs x %dM rows = %lldM total) ===\n",
-           n_dbs, rows_per / 1000000, (long long)(total_expected / 1000000));
+    if (rows_per >= 1000000)
+        printf("\n=== Federation Showdown (%d DBs x %dM rows = %lldM total) ===\n",
+               n_dbs, rows_per / 1000000, (long long)(total_expected / 1000000));
+    else
+        printf("\n=== Federation Showdown (%d DBs x %dK rows = %lldK total) ===\n",
+               n_dbs, rows_per / 1000, (long long)(total_expected / 1000));
 
     /* Setup */
     char cmd[256];
@@ -1496,7 +1511,7 @@ static void bench_scenario_drain(void)
 
         bench_timer t; timer_init(&t, 200);
         int64_t rows = 0;
-        bench_run_query(db, queries[q].sql, 1, 50, &t, &rows);
+        bench_run_query(db, queries[q].sql, 1, QUICK(50, 15), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row(queries[q].label, &s);
         csv_append("drain", queries[q].label, &s);
@@ -1536,7 +1551,7 @@ static void bench_scenario_agg_pushdown(void)
     {
         bench_timer t; timer_init(&t, 200);
         int64_t rows = 0;
-        bench_run_query(db, "SELECT COUNT(*) FROM bench_items", 1, 20, &t, &rows);
+        bench_run_query(db, "SELECT COUNT(*) FROM bench_items", 1, QUICK(20, 8), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("vtab_count_star", &s);
         csv_append("agg_pushdown", "vtab_count_star", &s);
@@ -1547,7 +1562,7 @@ static void bench_scenario_agg_pushdown(void)
     {
         bench_timer t; timer_init(&t, 200);
         int64_t rows = 0;
-        bench_run_query(db, "SELECT clearprism_count('items', NULL)", 1, 100, &t, &rows);
+        bench_run_query(db, "SELECT clearprism_count('items', NULL)", 1, QUICK(100, 30), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("pushdown_count", &s);
         csv_append("agg_pushdown", "pushdown_count", &s);
@@ -1558,7 +1573,7 @@ static void bench_scenario_agg_pushdown(void)
     {
         bench_timer t; timer_init(&t, 200);
         int64_t rows = 0;
-        bench_run_query(db, "SELECT SUM(value) FROM bench_items", 1, 20, &t, &rows);
+        bench_run_query(db, "SELECT SUM(value) FROM bench_items", 1, QUICK(20, 8), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("vtab_sum", &s);
         csv_append("agg_pushdown", "vtab_sum", &s);
@@ -1569,7 +1584,7 @@ static void bench_scenario_agg_pushdown(void)
     {
         bench_timer t; timer_init(&t, 200);
         int64_t rows = 0;
-        bench_run_query(db, "SELECT clearprism_sum('items', 'value', NULL)", 1, 100, &t, &rows);
+        bench_run_query(db, "SELECT clearprism_sum('items', 'value', NULL)", 1, QUICK(100, 30), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("pushdown_sum", &s);
         csv_append("agg_pushdown", "pushdown_sum", &s);
@@ -1582,7 +1597,7 @@ static void bench_scenario_agg_pushdown(void)
         int64_t rows = 0;
         bench_run_query(db,
             "SELECT clearprism_count('items', 'category = ''cat_042''')",
-            1, 100, &t, &rows);
+            1, QUICK(100, 30), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("pushdown_cnt_where", &s);
         csv_append("agg_pushdown", "pushdown_cnt_where", &s);
@@ -1595,7 +1610,7 @@ static void bench_scenario_agg_pushdown(void)
         int64_t rows = 0;
         bench_run_query(db,
             "SELECT clearprism_avg('items', 'value', NULL)",
-            1, 100, &t, &rows);
+            1, QUICK(100, 30), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("pushdown_avg", &s);
         csv_append("agg_pushdown", "pushdown_avg", &s);
@@ -1608,7 +1623,7 @@ static void bench_scenario_agg_pushdown(void)
         int64_t rows = 0;
         bench_run_query(db,
             "SELECT clearprism_min('items', 'value', NULL)",
-            1, 100, &t, &rows);
+            1, QUICK(100, 30), &t, &rows);
         bench_stats s; timer_compute(&t, rows, &s);
         print_row("pushdown_min", &s);
         csv_append("agg_pushdown", "pushdown_min", &s);
@@ -1624,13 +1639,20 @@ static void bench_scenario_agg_pushdown(void)
 
 static void bench_scenario_snapshot(void)
 {
-    struct { int n_src; int rows_per; const char *label; } configs[] = {
+    struct { int n_src; int rows_per; const char *label; } all_snap_configs[] = {
         {10,  1000,  "10x1K"},
         {10,  10000, "10x10K"},
         {100, 1000,  "100x1K"},
         {1000, 1000, "1000x1K"},
     };
-    int n_configs = (int)(sizeof(configs) / sizeof(configs[0]));
+    struct { int n_src; int rows_per; const char *label; } quick_snap_configs[] = {
+        {10,  1000,  "10x1K"},
+        {10,  10000, "10x10K"},
+        {100, 1000,  "100x1K"},
+    };
+    struct { int n_src; int rows_per; const char *label; } *configs =
+        bench_quick_mode ? quick_snap_configs : all_snap_configs;
+    int n_configs = bench_quick_mode ? 3 : 4;
 
     for (int ci = 0; ci < n_configs; ci++) {
         int n_src = configs[ci].n_src;
@@ -2103,6 +2125,12 @@ int main(int argc, char **argv)
 {
     const char *selected = argc > 1 ? argv[1] : NULL;
 
+    /* Quick mode: run all scenarios with reduced sizes */
+    if (selected && strcmp(selected, "quick") == 0) {
+        bench_quick_mode = 1;
+        selected = NULL;
+    }
+
     /* Cap virtual memory at 8 GB to prevent OOM crashes */
     {
         struct rlimit rl;
@@ -2111,7 +2139,8 @@ int main(int argc, char **argv)
         setrlimit(RLIMIT_AS, &rl);
     }
 
-    printf("=== Clearprism Benchmark Suite ===\n");
+    printf("=== Clearprism Benchmark Suite%s ===\n",
+           bench_quick_mode ? " (Quick)" : "");
     printf("Version: %s\n", CLEARPRISM_VERSION_STRING);
     printf("SQLite: %s\n", sqlite3_libversion());
     printf("Max prepare threads: %d\n", CLEARPRISM_MAX_PREPARE_THREADS);
@@ -2141,7 +2170,7 @@ int main(int argc, char **argv)
 
     if (selected && ran == 0) {
         printf("\nUnknown scenario: '%s'\n", selected);
-        printf("Available: ");
+        printf("Available: quick, ");
         for (int i = 0; i < n_scenarios; i++)
             printf("%s%s", scenarios[i].name, i < n_scenarios - 1 ? ", " : "\n");
         return 1;
