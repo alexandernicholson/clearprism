@@ -2382,6 +2382,62 @@ static void test_vtab_snapshot_destroy(void)
     cleanup_test_files();
 }
 
+/* Test: load_extension parameter is accepted without error */
+static void test_load_extension_param_accepted(void)
+{
+    /* Setup: create a registry with one source */
+    const char *reg = "/tmp/clearprism_loadext_reg.db";
+    const char *src = "/tmp/clearprism_loadext_src.db";
+    unlink(reg); unlink(src);
+
+    sqlite3 *db = NULL;
+    sqlite3_open(src, &db);
+    sqlite3_exec(db, "CREATE TABLE t (id INTEGER, val TEXT);", NULL, NULL, NULL);
+    sqlite3_close(db);
+
+    sqlite3_open(reg, &db);
+    sqlite3_exec(db,
+        "CREATE TABLE clearprism_sources ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  path TEXT NOT NULL UNIQUE,"
+        "  alias TEXT NOT NULL UNIQUE,"
+        "  active INTEGER NOT NULL DEFAULT 1,"
+        "  priority INTEGER NOT NULL DEFAULT 0,"
+        "  added_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  notes TEXT);"
+        "CREATE TABLE clearprism_table_overrides ("
+        "  source_id INTEGER NOT NULL,"
+        "  table_name TEXT NOT NULL,"
+        "  active INTEGER NOT NULL DEFAULT 1,"
+        "  PRIMARY KEY (source_id, table_name));",
+        NULL, NULL, NULL);
+    char *sql = sqlite3_mprintf(
+        "INSERT INTO clearprism_sources (path, alias) VALUES ('%s', 'src1')", src);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+    sqlite3_close(db);
+
+    /* Test: create vtab with load_extension parameter */
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *create_sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE test_ext USING clearprism("
+        "  registry_db='%s', table='t',"
+        "  load_extension='/nonexistent/path/to/libjolie'"
+        ")", reg);
+    int rc = sqlite3_exec(db, create_sql, NULL, NULL, NULL);
+    sqlite3_free(create_sql);
+
+    /* Vtab creation should succeed (extension path is stored, not loaded yet) */
+    int passed = (rc == SQLITE_OK);
+    test_report("load_extension param accepted", passed);
+
+    sqlite3_exec(db, "DROP TABLE test_ext", NULL, NULL, NULL);
+    sqlite3_close(db);
+    unlink(reg); unlink(src);
+}
+
 int test_vtab_run(void)
 {
     test_vtab_basic_select();
@@ -2442,6 +2498,9 @@ int test_vtab_run(void)
     test_vtab_snapshot_orderby();
     test_vtab_snapshot_l1_cache();
     test_vtab_snapshot_destroy();
+
+    /* Jolie integration: load_extension parameter */
+    test_load_extension_param_accepted();
 
     return 0;
 }

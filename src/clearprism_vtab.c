@@ -227,6 +227,9 @@ static int vtab_parse_args(int argc, const char *const *argv,
                     "clearprism: invalid mode '%s' (expected 'live' or 'snapshot')", value);
                 sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
             }
+        } else if (strcmp(key, "load_extension") == 0) {
+            vtab->load_extension = value;
+            value = NULL;  /* transfer ownership */
         } else {
             *pzErr = clearprism_mprintf("clearprism: unknown parameter '%s'", key);
             sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
@@ -618,6 +621,7 @@ static void vtab_free(clearprism_vtab *vtab)
     sqlite3_free(vtab->snapshot_table);
     sqlite3_free(vtab->init_warnings);
     sqlite3_free(vtab->schema_override);
+    sqlite3_free(vtab->load_extension);
 
     if (vtab->cols) {
         for (int i = 0; i < vtab->nCol; i++) {
