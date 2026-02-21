@@ -29,7 +29,7 @@ SQLITE_EXTENSION_INIT3
 
 /* ========== Global vtab registry ========== */
 
-#define VTAB_MAP_MAX 64
+#define VTAB_MAP_MAX 128
 
 static pthread_mutex_t g_vtab_map_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct {
@@ -54,6 +54,10 @@ void clearprism_register_vtab(const char *table, clearprism_vtab *vtab)
         g_vtab_map[g_vtab_map_size].table = clearprism_strdup(table);
         g_vtab_map[g_vtab_map_size].vtab = vtab;
         g_vtab_map_size++;
+    } else {
+        sqlite3_log(SQLITE_WARNING,
+            "clearprism: vtab map full (%d entries), cannot register '%s'",
+            VTAB_MAP_MAX, table);
     }
     pthread_mutex_unlock(&g_vtab_map_lock);
 }
@@ -66,6 +70,18 @@ void clearprism_unregister_vtab(const char *table)
             sqlite3_free(g_vtab_map[i].table);
             g_vtab_map[i] = g_vtab_map[--g_vtab_map_size];
             break;
+        }
+    }
+    pthread_mutex_unlock(&g_vtab_map_lock);
+}
+
+void clearprism_unregister_vtab_ptr(clearprism_vtab *vtab)
+{
+    pthread_mutex_lock(&g_vtab_map_lock);
+    for (int i = g_vtab_map_size - 1; i >= 0; i--) {
+        if (g_vtab_map[i].vtab == vtab) {
+            sqlite3_free(g_vtab_map[i].table);
+            g_vtab_map[i] = g_vtab_map[--g_vtab_map_size];
         }
     }
     pthread_mutex_unlock(&g_vtab_map_lock);

@@ -586,6 +586,12 @@ static int vtab_init(sqlite3 *db, int argc, const char *const *argv,
     /* Register vtab in global map for aggregate function lookup */
     clearprism_register_vtab(vtab->target_table, vtab);
 
+    /* Also register with the SQL table name (argv[2]) if it differs,
+     * so clearprism_query('fed', ...) can find the vtab by SQL name */
+    if (argc >= 3 && argv[2] && strcmp(argv[2], vtab->target_table) != 0) {
+        clearprism_register_vtab(argv[2], vtab);
+    }
+
     *ppVtab = &vtab->base;
     return SQLITE_OK;
 }
@@ -610,9 +616,8 @@ static void vtab_free(clearprism_vtab *vtab)
 {
     if (!vtab) return;
 
-    /* Unregister from global vtab map */
-    if (vtab->target_table)
-        clearprism_unregister_vtab(vtab->target_table);
+    /* Unregister all entries for this vtab from global map */
+    clearprism_unregister_vtab_ptr(vtab);
 
     if (vtab->work_pool) clearprism_work_pool_destroy(vtab->work_pool);
     if (vtab->cache) clearprism_cache_destroy(vtab->cache);

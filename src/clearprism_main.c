@@ -55,7 +55,9 @@ int clearprism_init(sqlite3 *db) {
     if (rc != SQLITE_OK) return rc;
     rc = clearprism_register_agg_functions(db);
     if (rc != SQLITE_OK) return rc;
-    return clearprism_register_admin_functions(db);
+    rc = clearprism_register_admin_functions(db);
+    if (rc != SQLITE_OK) return rc;
+    return clearprism_register_tvf(db);
 }
 #endif
 
@@ -94,6 +96,16 @@ int sqlite3_clearprism_init(sqlite3 *db, char **pzErrMsg,
     if (rc != SQLITE_OK) {
         if (pzErrMsg) {
             *pzErrMsg = sqlite3_mprintf("clearprism: failed to register admin functions: %s",
+                                         sqlite3_errmsg(db));
+        }
+        return rc;
+    }
+
+    /* Register clearprism_query() table-valued function */
+    rc = clearprism_register_tvf(db);
+    if (rc != SQLITE_OK) {
+        if (pzErrMsg) {
+            *pzErrMsg = sqlite3_mprintf("clearprism: failed to register TVF: %s",
                                          sqlite3_errmsg(db));
         }
     }

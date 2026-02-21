@@ -543,12 +543,16 @@ void clearprism_work_pool_run(clearprism_work_pool *pool,
 /* clearprism_agg.c — Aggregate pushdown functions */
 int clearprism_register_agg_functions(sqlite3 *db);
 
+/* clearprism_tvf.c — clearprism_query() table-valued function */
+int clearprism_register_tvf(sqlite3 *db);
+
 /* clearprism_admin.c — Admin/diagnostic SQL functions */
 int clearprism_register_admin_functions(sqlite3 *db);
 
 /* Per-connection vtab registry for aggregate function lookup */
 void clearprism_register_vtab(const char *table, clearprism_vtab *vtab);
 void clearprism_unregister_vtab(const char *table);
+void clearprism_unregister_vtab_ptr(clearprism_vtab *vtab);
 clearprism_vtab *clearprism_lookup_vtab(const char *table);
 
 /* ---------- Streaming Scanner API ---------- */

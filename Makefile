@@ -27,7 +27,8 @@ SRCS = src/clearprism_main.c \
        src/clearprism_util.c \
        src/clearprism_agg.c \
        src/clearprism_scanner.c \
-       src/clearprism_admin.c
+       src/clearprism_admin.c \
+       src/clearprism_tvf.c
 
 TEST_SRCS = test/test_main.c \
             test/test_vtab.c \
@@ -36,7 +37,8 @@ TEST_SRCS = test/test_main.c \
             test/test_registry.c \
             test/test_agg.c \
             test/test_scanner.c \
-            test/test_admin.c
+            test/test_admin.c \
+            test/test_tvf.c
 
 BENCH_SRCS = bench/bench_main.c
 
