@@ -438,6 +438,11 @@ static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr)
         return SQLITE_ERROR;
     }
 
+    /* Configure extension loading on pool connections */
+    if (vtab->load_extension) {
+        clearprism_connpool_set_extension(vtab->pool, vtab->load_extension);
+    }
+
     /* L1 cache */
     clearprism_l1_cache *l1 = clearprism_l1_create(vtab->l1_max_rows,
                                                      vtab->l1_max_bytes,

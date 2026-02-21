@@ -143,6 +143,7 @@ struct clearprism_connpool {
     int      current_checked_out;
     pthread_mutex_t lock;
     pthread_cond_t  cond;   /* signaled when a connection is checked in */
+    char *load_extension;    /* path to extension to load on new connections */
 };
 
 /* ---------- L1 in-memory LRU cache ---------- */
@@ -436,6 +437,8 @@ void     clearprism_connpool_stats(clearprism_connpool *pool,
                                     int *out_open, int *out_max,
                                     int *out_checked_out,
                                     int64_t *out_total_checkouts);
+void     clearprism_connpool_set_extension(clearprism_connpool *pool,
+                                            const char *extension_path);
 
 /* clearprism_where.c */
 char    *clearprism_where_encode(sqlite3_index_info *info, int nCol, int *out_flags);

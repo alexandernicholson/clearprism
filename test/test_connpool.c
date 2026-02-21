@@ -188,6 +188,78 @@ static void test_pool_invalid_path(void)
     clearprism_connpool_destroy(pool);
 }
 
+/* Test: extension is loaded on new connections when configured */
+static void test_pool_load_extension(void)
+{
+    /* For test purposes, we test that pool accepts the extension path
+       and that checkout still works with no extension set */
+    clearprism_connpool *pool = clearprism_connpool_create(4, 5000);
+
+    /* Set extension path to NULL (no extension) */
+    clearprism_connpool_set_extension(pool, NULL);
+
+    const char *src = "/tmp/clearprism_pool_ext_test.db";
+    unlink(src);
+    sqlite3 *setup_db;
+    sqlite3_open(src, &setup_db);
+    sqlite3_exec(setup_db, "CREATE TABLE t (id INTEGER);", NULL, NULL, NULL);
+    sqlite3_close(setup_db);
+
+    char *err = NULL;
+    sqlite3 *conn = clearprism_connpool_checkout(pool, src, "test", &err);
+    int passed = (conn != NULL);
+    test_report("pool checkout with no extension", passed);
+    if (conn) clearprism_connpool_checkin(pool, src);
+
+    sqlite3_free(err);
+    clearprism_connpool_destroy(pool);
+    unlink(src);
+}
+
+/* Test: extension load failure is non-fatal — checkout still succeeds */
+static void test_pool_extension_load_failure(void)
+{
+    clearprism_connpool *pool = clearprism_connpool_create(4, 5000);
+    if (!pool) {
+        test_report("pool_extension_load_failure (setup)", 0);
+        return;
+    }
+
+    /* Point at a shared library that does not exist */
+    clearprism_connpool_set_extension(pool, "/nonexistent/lib.so");
+
+    const char *src = "/tmp/clearprism_pool_extfail_test.db";
+    unlink(src);
+    sqlite3 *setup_db;
+    sqlite3_open(src, &setup_db);
+    sqlite3_exec(setup_db, "CREATE TABLE t (id INTEGER);", NULL, NULL, NULL);
+    sqlite3_close(setup_db);
+
+    char *err = NULL;
+    sqlite3 *conn = clearprism_connpool_checkout(pool, src, "test", &err);
+    test_report("checkout succeeds despite extension load failure", conn != NULL);
+    if (err) {
+        printf("    (expected) extension error: %s\n", err);
+        sqlite3_free(err);
+    }
+
+    if (conn) {
+        /* Verify the connection is still usable */
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(conn, "SELECT 1", -1, &stmt, NULL);
+        test_report("conn usable after extension load failure", rc == SQLITE_OK);
+        if (stmt) {
+            rc = sqlite3_step(stmt);
+            test_report("SELECT 1 works after extension load failure", rc == SQLITE_ROW);
+            sqlite3_finalize(stmt);
+        }
+        clearprism_connpool_checkin(pool, src);
+    }
+
+    clearprism_connpool_destroy(pool);
+    unlink(src);
+}
+
 int test_connpool_run(void)
 {
     test_pool_create_destroy();
@@ -195,5 +267,7 @@ int test_connpool_run(void)
     test_pool_multiple_dbs();
     test_pool_eviction();
     test_pool_invalid_path();
+    test_pool_load_extension();
+    test_pool_extension_load_failure();
     return 0;
 }
