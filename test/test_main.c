@@ -17,6 +17,7 @@ extern int test_agg_run(void);
 extern int test_scanner_run(void);
 extern int test_admin_run(void);
 extern int test_tvf_run(void);
+extern int test_jolie_integration_run(void);
 
 /* Simple test framework */
 static int total_tests = 0;
@@ -72,6 +73,10 @@ int main(int argc, char **argv)
 
     printf("[Table-Valued Function Tests]\n");
     test_tvf_run();
+    printf("\n");
+
+    printf("[Jolie Integration Tests]\n");
+    test_jolie_integration_run();
     printf("\n");
 
     printf("=== Results: %d/%d passed", passed_tests, total_tests);

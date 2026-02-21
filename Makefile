@@ -38,7 +38,8 @@ TEST_SRCS = test/test_main.c \
             test/test_agg.c \
             test/test_scanner.c \
             test/test_admin.c \
-            test/test_tvf.c
+            test/test_tvf.c \
+            test/test_jolie_integration.c
 
 BENCH_SRCS = bench/bench_main.c
 
