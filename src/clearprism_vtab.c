@@ -301,6 +301,7 @@ static int vtab_discover_schema(clearprism_vtab *vtab, char **pzErr)
     }
 
     /* Load extension on discovery connection if configured (non-fatal) */
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
     if (vtab->load_extension) {
         sqlite3_db_config(src_db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
         char *ext_err = NULL;
@@ -316,6 +317,7 @@ static int vtab_discover_schema(clearprism_vtab *vtab, char **pzErr)
                succeed for vanilla tables or if table exists as a regular table */
         }
     }
+#endif
 
     char *pragma_sql = clearprism_mprintf("PRAGMA table_info(\"%s\")", vtab->target_table);
     sqlite3_stmt *stmt = NULL;

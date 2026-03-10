@@ -171,6 +171,7 @@ sqlite3 *clearprism_connpool_checkout(clearprism_connpool *pool,
     sqlite3_busy_timeout(entry->conn, 1000);
 
     /* Load extension on new connections if configured */
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
     if (pool->load_extension) {
         sqlite3_db_config(entry->conn, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
         char *ext_err = NULL;
@@ -184,6 +185,7 @@ sqlite3 *clearprism_connpool_checkout(clearprism_connpool *pool,
             /* Non-fatal: continue without extension */
         }
     }
+#endif
 
     entry->checkout_count = 1;
     entry->last_used = time(NULL);

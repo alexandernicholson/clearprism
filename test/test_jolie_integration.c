@@ -25,6 +25,9 @@ static const char *get_jolie_path(void)
 
 static int jolie_available(void)
 {
+#ifdef SQLITE_OMIT_LOAD_EXTENSION
+    return 0;
+#else
     const char *path = get_jolie_path();
     /* Try loading into a throwaway connection */
     sqlite3 *db;
@@ -35,6 +38,7 @@ static int jolie_available(void)
     sqlite3_free(err);
     sqlite3_close(db);
     return (rc == SQLITE_OK);
+#endif
 }
 
 /* Helper: create a jolie-backed source database */
@@ -43,9 +47,11 @@ static void create_jolie_source(const char *db_path, const char *data_sql)
     unlink(db_path);
     sqlite3 *db;
     sqlite3_open(db_path, &db);
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
     sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
     sqlite3_load_extension(db, get_jolie_path(), NULL, NULL);
     sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, NULL);
+#endif
 
     /* Create vanilla table and insert data */
     sqlite3_exec(db,
