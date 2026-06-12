@@ -50,12 +50,15 @@ clearprism_connpool *clearprism_connpool_create(int max_open, int timeout_ms)
 }
 
 void clearprism_connpool_set_extension(clearprism_connpool *pool,
-                                        const char *extension_path)
+                                        const char *extension_path,
+                                        const char *entry_point)
 {
     if (!pool) return;
     pthread_mutex_lock(&pool->lock);
     sqlite3_free(pool->load_extension);
+    sqlite3_free(pool->load_extension_entry);
     pool->load_extension = extension_path ? clearprism_strdup(extension_path) : NULL;
+    pool->load_extension_entry = entry_point ? clearprism_strdup(entry_point) : NULL;
     pthread_mutex_unlock(&pool->lock);
 }
 
@@ -77,6 +80,7 @@ void clearprism_connpool_destroy(clearprism_connpool *pool)
         }
     }
     sqlite3_free(pool->load_extension);
+    sqlite3_free(pool->load_extension_entry);
     sqlite3_free(pool->buckets);
     pthread_mutex_unlock(&pool->lock);
     pthread_mutex_destroy(&pool->lock);
@@ -176,7 +180,7 @@ sqlite3 *clearprism_connpool_checkout(clearprism_connpool *pool,
         sqlite3_db_config(entry->conn, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
         char *ext_err = NULL;
         int ext_rc = sqlite3_load_extension(entry->conn, pool->load_extension,
-                                             NULL, &ext_err);
+                                             pool->load_extension_entry, &ext_err);
         sqlite3_db_config(entry->conn, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, NULL);
         if (ext_rc != SQLITE_OK) {
             sqlite3_log(SQLITE_WARNING, "clearprism: extension load failed for '%s': %s",

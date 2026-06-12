@@ -230,6 +230,9 @@ static int vtab_parse_args(int argc, const char *const *argv,
         } else if (strcmp(key, "load_extension") == 0) {
             vtab->load_extension = value;
             value = NULL;  /* transfer ownership */
+        } else if (strcmp(key, "load_extension_entry") == 0) {
+            vtab->load_extension_entry = value;
+            value = NULL;  /* transfer ownership */
         } else {
             *pzErr = clearprism_mprintf("clearprism: unknown parameter '%s'", key);
             sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
@@ -306,7 +309,7 @@ static int vtab_discover_schema(clearprism_vtab *vtab, char **pzErr)
         sqlite3_db_config(src_db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
         char *ext_err = NULL;
         int ext_rc = sqlite3_load_extension(src_db, vtab->load_extension,
-                                             NULL, &ext_err);
+                                             vtab->load_extension_entry, &ext_err);
         sqlite3_db_config(src_db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, NULL);
         if (ext_rc != SQLITE_OK) {
             sqlite3_log(SQLITE_WARNING,
@@ -459,7 +462,8 @@ static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr)
 
     /* Configure extension loading on pool connections */
     if (vtab->load_extension) {
-        clearprism_connpool_set_extension(vtab->pool, vtab->load_extension);
+        clearprism_connpool_set_extension(vtab->pool, vtab->load_extension,
+                                          vtab->load_extension_entry);
     }
 
     /* L1 cache */
@@ -651,6 +655,7 @@ static void vtab_free(clearprism_vtab *vtab)
     sqlite3_free(vtab->init_warnings);
     sqlite3_free(vtab->schema_override);
     sqlite3_free(vtab->load_extension);
+    sqlite3_free(vtab->load_extension_entry);
 
     if (vtab->cols) {
         for (int i = 0; i < vtab->nCol; i++) {

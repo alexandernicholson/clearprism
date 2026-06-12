@@ -196,7 +196,7 @@ static void test_pool_load_extension(void)
     clearprism_connpool *pool = clearprism_connpool_create(4, 5000);
 
     /* Set extension path to NULL (no extension) */
-    clearprism_connpool_set_extension(pool, NULL);
+    clearprism_connpool_set_extension(pool, NULL, NULL);
 
     const char *src = "/tmp/clearprism_pool_ext_test.db";
     unlink(src);
@@ -226,7 +226,7 @@ static void test_pool_extension_load_failure(void)
     }
 
     /* Point at a shared library that does not exist */
-    clearprism_connpool_set_extension(pool, "/nonexistent/lib.so");
+    clearprism_connpool_set_extension(pool, "/nonexistent/lib.so", NULL);
 
     const char *src = "/tmp/clearprism_pool_extfail_test.db";
     unlink(src);
