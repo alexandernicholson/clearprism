@@ -2,11 +2,19 @@
  * clearprism_main.c — Extension entry point, module registration
  */
 
-#ifndef SQLITE_CORE
-#define SQLITE_CORE 0
+/*
+ * sqlite3ext.h activates its sqlite3_api redirection only when
+ * SQLITE_CORE is UNDEFINED — it tests #ifndef, not the value. A
+ * -DSQLITE_CORE=0 build therefore silently emits direct libsqlite3
+ * calls, which crash any host that embeds its own SQLite (the loaded
+ * library receives connection pointers it does not own). Treat a zero
+ * value as "extension build" by undefining it.
+ */
+#if defined(SQLITE_CORE) && !(SQLITE_CORE + 0)
+#undef SQLITE_CORE
 #endif
 
-#if !SQLITE_CORE
+#ifndef SQLITE_CORE
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
 #else

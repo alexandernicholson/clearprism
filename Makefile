@@ -1,17 +1,27 @@
 CC ?= gcc
 CFLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter -fPIC -O2
 LDFLAGS = -lsqlite3 -lpthread
+# The loadable extension must NOT link libsqlite3: every sqlite3_* call
+# routes through the sqlite3_api redirection, and linking the system
+# library would let a missed redirection bind to the wrong SQLite at
+# runtime (crashing hosts that embed their own SQLite). Leaving it off
+# turns that mistake into a link error on macOS.
+EXT_LDFLAGS = -lpthread
 
-INCLUDES = -Iinclude
+INCLUDES = -Ivendor/sqlite -Iinclude
 
 # Detect OS for shared library suffix
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 	SHARED_EXT = .dylib
 	SHARED_FLAGS = -dynamiclib
+	# Apple's system libsqlite3 is built with SQLITE_OMIT_LOAD_EXTENSION;
+	# the statically-linked test/bench binaries must match it.
+	TEST_DEFS = -DSQLITE_OMIT_LOAD_EXTENSION
 else
 	SHARED_EXT = .so
 	SHARED_FLAGS = -shared
+	TEST_DEFS =
 endif
 
 # Source files
@@ -57,20 +67,20 @@ BENCH_TARGET = clearprism_bench
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(SHARED_FLAGS) -o $@ $^ $(EXT_LDFLAGS)
 
 src/%.o: src/%.c include/clearprism.h
-	$(CC) $(CFLAGS) $(INCLUDES) -DSQLITE_CORE=0 -c -o $@ $<
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
 # Test build - compile source files with CLEARPRISM_TESTING and SQLITE_CORE
 test/%.o: test/%.c include/clearprism.h
-	$(CC) $(CFLAGS) $(INCLUDES) -Isrc -DCLEARPRISM_TESTING=1 -DSQLITE_CORE=1 -c -o $@ $<
+	$(CC) $(CFLAGS) $(INCLUDES) -Isrc -DCLEARPRISM_TESTING=1 -DSQLITE_CORE=1 $(TEST_DEFS) -c -o $@ $<
 
 # Recompile source files for testing (with SQLITE_CORE=1)
 SRCS_TEST_OBJS = $(patsubst src/%.c,src/%-test.o,$(SRCS))
 
 src/%-test.o: src/%.c include/clearprism.h
-	$(CC) $(CFLAGS) $(INCLUDES) -DCLEARPRISM_TESTING=1 -DSQLITE_CORE=1 -c -o $@ $<
+	$(CC) $(CFLAGS) $(INCLUDES) -DCLEARPRISM_TESTING=1 -DSQLITE_CORE=1 $(TEST_DEFS) -c -o $@ $<
 
 $(TEST_TARGET): $(SRCS_TEST_OBJS) $(TEST_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)

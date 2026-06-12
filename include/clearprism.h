@@ -8,7 +8,14 @@
 #ifndef CLEARPRISM_H
 #define CLEARPRISM_H
 
+/* SQLITE_CORE=0 must mean "extension build" — see clearprism_main.c. */
+#if defined(SQLITE_CORE) && !(SQLITE_CORE + 0)
+#undef SQLITE_CORE
+#endif
+
 #include <sqlite3ext.h>
+SQLITE_EXTENSION_INIT3
+
 #include <pthread.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -144,6 +151,7 @@ struct clearprism_connpool {
     pthread_mutex_t lock;
     pthread_cond_t  cond;   /* signaled when a connection is checked in */
     char *load_extension;    /* path to extension to load on new connections */
+    char *load_extension_entry; /* explicit entry point (NULL = derive from filename) */
 };
 
 /* ---------- L1 in-memory LRU cache ---------- */
@@ -308,6 +316,8 @@ struct clearprism_vtab {
     int   l2_disabled;        /* 1 if user explicitly set cache_db='none' */
     char *schema_override;    /* user-supplied schema string (if any) */
     char *load_extension;     /* path to extension to load on source connections (e.g. libjolie) */
+    char *load_extension_entry; /* explicit entry point; SQLite's filename-derived
+                                   default fails for names like libsqlite_columnpq */
 };
 
 /* ---------- Cursor ---------- */
@@ -438,7 +448,8 @@ void     clearprism_connpool_stats(clearprism_connpool *pool,
                                     int *out_checked_out,
                                     int64_t *out_total_checkouts);
 void     clearprism_connpool_set_extension(clearprism_connpool *pool,
-                                            const char *extension_path);
+                                            const char *extension_path,
+                                            const char *entry_point);
 
 /* clearprism_where.c */
 char    *clearprism_where_encode(sqlite3_index_info *info, int nCol, int *out_flags);

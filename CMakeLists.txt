@@ -41,15 +41,16 @@ set(CLEARPRISM_SOURCES
 # Shared library (loadable extension)
 add_library(clearprism SHARED ${CLEARPRISM_SOURCES})
 target_include_directories(clearprism PRIVATE
+    ${CMAKE_SOURCE_DIR}/vendor/sqlite
     ${CMAKE_SOURCE_DIR}/include
     ${SQLITE3_INCLUDE_DIRS}
 )
+# No libsqlite3 and no SQLITE_CORE define: the loadable extension
+# routes all sqlite3_* calls through the sqlite3_api redirection,
+# which sqlite3ext.h enables only when SQLITE_CORE is undefined
+# (see clearprism_main.c).
 target_link_libraries(clearprism PRIVATE
-    ${SQLITE3_LIBRARIES}
     Threads::Threads
-)
-target_compile_definitions(clearprism PRIVATE
-    SQLITE_CORE=0
 )
 target_compile_options(clearprism PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
@@ -73,6 +74,7 @@ add_executable(clearprism_tests
     ${CLEARPRISM_SOURCES}
 )
 target_include_directories(clearprism_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/vendor/sqlite
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
     ${SQLITE3_INCLUDE_DIRS}
