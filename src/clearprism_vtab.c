@@ -204,6 +204,7 @@ static int vtab_parse_args(int argc, const char *const *argv,
                 sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
             }
             vtab->l1_max_rows = v;
+            vtab->l1_enabled = 1;
         } else if (strcmp(key, "l1_max_bytes") == 0) {
             int64_t v;
             if (!parse_positive_int64(value, "l1_max_bytes", &v, pzErr)) {
@@ -211,6 +212,7 @@ static int vtab_parse_args(int argc, const char *const *argv,
             }
             vtab->l1_max_bytes = v;
             user_set_max_bytes = 1;
+            vtab->l1_enabled = 1;
         } else if (strcmp(key, "pool_max_open") == 0) {
             if (!parse_positive_int(value, "pool_max_open", &vtab->pool_max_open, pzErr)) {
                 sqlite3_free(key); sqlite3_free(value); return SQLITE_ERROR;
@@ -249,12 +251,6 @@ static int vtab_parse_args(int argc, const char *const *argv,
     if (!vtab->target_table) {
         *pzErr = clearprism_strdup("clearprism: 'table' argument is required");
         return SQLITE_ERROR;
-    }
-
-    /* Auto-generate L2 cache path if not specified and not disabled */
-    if (!vtab->cache_db_path && !vtab->l2_disabled) {
-        vtab->cache_db_path = clearprism_mprintf(
-            "/tmp/clearprism_cache_%s_%s.db", argv[2], vtab->target_table);
     }
 
     /* Auto-scale L1 byte budget when l1_max_rows is set large but
@@ -466,13 +462,15 @@ static int vtab_init_subsystems(clearprism_vtab *vtab, char **pzErr)
                                           vtab->load_extension_entry);
     }
 
-    /* L1 cache */
-    clearprism_l1_cache *l1 = clearprism_l1_create(vtab->l1_max_rows,
-                                                     vtab->l1_max_bytes,
-                                                     CLEARPRISM_DEFAULT_L1_TTL_SEC);
-    if (!l1) {
-        *pzErr = clearprism_strdup("clearprism: failed to create L1 cache");
-        return SQLITE_ERROR;
+    /* L1 cache (opt-in via l1_max_rows / l1_max_bytes) */
+    clearprism_l1_cache *l1 = NULL;
+    if (vtab->l1_enabled) {
+        l1 = clearprism_l1_create(vtab->l1_max_rows, vtab->l1_max_bytes,
+                                  CLEARPRISM_DEFAULT_L1_TTL_SEC);
+        if (!l1) {
+            *pzErr = clearprism_strdup("clearprism: failed to create L1 cache");
+            return SQLITE_ERROR;
+        }
     }
 
     /* L2 cache (optional — only if cache_db is specified) */

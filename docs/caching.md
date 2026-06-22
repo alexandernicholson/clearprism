@@ -2,6 +2,8 @@
 
 Clearprism implements a two-tier caching system to reduce repeated queries to source databases.
 
+Both tiers are **off by default** — clearprism performs no caching unless you opt in. Enable L1 by setting `l1_max_rows` or `l1_max_bytes`; enable L2 by setting `cache_db='<path>'`.
+
 ```mermaid
 flowchart LR
     QUERY["Query"] --> L1{"L1<br>In-Memory LRU"}
@@ -16,7 +18,7 @@ flowchart LR
 
 ## L1: In-Memory LRU Cache
 
-The L1 cache stores query results in memory using a hash table with a doubly-linked LRU list. It is always enabled.
+The L1 cache stores query results in memory using a hash table with a doubly-linked LRU list. It is opt-in: enabled only when `l1_max_rows` or `l1_max_bytes` is set on the virtual table. With neither set there is no L1 cache.
 
 ### Cache Key
 
@@ -76,7 +78,7 @@ flowchart TD
 
 ## L2: Shadow Table Cache
 
-The L2 cache materializes a copy of all source data into a local SQLite database. It is auto-enabled by default (at `/tmp/clearprism_cache_{vtab}_{table}.db`); set `cache_db='none'` to disable. The initial populate runs asynchronously in a background thread, so `CREATE VIRTUAL TABLE` returns immediately. If the background populate has finished by the time a query runs, simple queries (full scans without ORDER BY/LIMIT) serve directly from the shadow table — avoiding the slow virtual table protocol path entirely. If the populate is still in progress, queries fall through to the live path without blocking.
+The L2 cache materializes a copy of all source data into a local SQLite database. It is opt-in: enabled only when `cache_db='<path>'` is set. By default there is no L2 cache — no shadow copy and no background refresh thread. (`cache_db='none'` is still accepted and is a no-op.) The initial populate runs asynchronously in a background thread, so `CREATE VIRTUAL TABLE` returns immediately. If the background populate has finished by the time a query runs, simple queries (full scans without ORDER BY/LIMIT) serve directly from the shadow table — avoiding the slow virtual table protocol path entirely. If the populate is still in progress, queries fall through to the live path without blocking.
 
 ### Shadow Table Schema
 

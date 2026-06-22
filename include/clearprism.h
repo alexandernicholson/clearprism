@@ -298,6 +298,7 @@ struct clearprism_vtab {
     /* Configuration */
     int64_t  l1_max_rows;
     int64_t  l1_max_bytes;
+    int      l1_enabled;
     int      pool_max_open;
     int      l2_refresh_interval_sec;
 

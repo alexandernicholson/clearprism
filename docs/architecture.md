@@ -24,7 +24,7 @@ The extension registers a module named `"clearprism"` via `sqlite3_create_module
 2. Opens the registry database and loads the source list
 3. Introspects the schema from the first active source via `PRAGMA table_info` (or uses the `schema` override if provided)
 4. Declares the virtual table schema to SQLite (with `_source_db TEXT HIDDEN` and `_source_errors INTEGER HIDDEN` appended)
-5. Initializes the connection pool, L1 cache, and L2 cache (L2 is auto-enabled by default at `/tmp/clearprism_cache_{vtab}_{table}.db`; initial populate runs asynchronously in a background thread so CREATE returns immediately; failures are non-fatal — logged as warnings; set `cache_db='none'` to disable)
+5. Initializes the connection pool, and (only when opted in) the L1 and/or L2 caches. Caching is off by default: L1 is created only when `l1_max_rows`/`l1_max_bytes` is set; L2 only when `cache_db='<path>'` is set. When L2 is enabled its initial populate runs asynchronously in a background thread so CREATE returns immediately; failures are non-fatal — logged as warnings.
 6. Logs any initialization warnings (unreachable sources, L2 failures)
 7. If `mode='snapshot'`, populates the snapshot shadow table (see [Snapshot Mode](#snapshot-mode))
 

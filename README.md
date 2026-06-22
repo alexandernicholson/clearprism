@@ -66,13 +66,14 @@ SELECT name, email, _source_db FROM all_users WHERE email LIKE '%@example.com';
 SELECT * FROM all_users WHERE _source_db = 'west_region';
 ```
 
-Caching is automatic — an L2 disk cache populates in the background as soon as the table is created. Once the background populate finishes, simple queries (full scans without ORDER BY/LIMIT) serve directly from the shadow table, avoiding the slow vtab protocol path entirely. If the populate is still in progress, queries use the live path without blocking. Queries with ORDER BY, LIMIT, or OFFSET always use the live path for correct handling, and their results populate the L1 in-memory cache. For datasets that never change, use **snapshot mode** to materialize all data at creation time:
+Caching is **off by default** — clearprism queries sources live unless you opt in. Set `cache_db='<path>'` to enable the L2 disk cache (a background shadow copy: once populated, simple full scans without ORDER BY/LIMIT serve from the shadow table; ORDER BY/LIMIT/OFFSET queries always use the live path). Set `l1_max_rows`/`l1_max_bytes` to enable the L1 in-memory result cache. For datasets that never change, use **snapshot mode** to materialize all data at creation time:
 
 ```sql
--- Default: L2 cache auto-populates in the background
+-- Opt into the L2 background cache
 CREATE VIRTUAL TABLE all_users USING clearprism(
     registry_db='/path/to/registry.db',
-    table='users'
+    table='users',
+    cache_db='/var/cache/clearprism/users.db'
 );
 
 -- Snapshot mode: materialize everything at creation, no background refresh
@@ -181,9 +182,9 @@ All parameters are passed as `key=value` pairs in the `CREATE VIRTUAL TABLE` sta
 | `registry_db` | Yes | — | Path to the registry database |
 | `table` | Yes | — | Name of the table to federate |
 | `mode` | No | `live` | `live` (query on demand) or `snapshot` (materialize at creation) |
-| `cache_db` | No | auto (`/tmp/...`) | Path for L2 disk cache; auto-generated if omitted, `'none'` to disable |
-| `l1_max_rows` | No | `10000` | Maximum rows in L1 memory cache |
-| `l1_max_bytes` | No | `67108864` | Maximum bytes in L1 cache (64 MiB) |
+| `cache_db` | No | off | Path to enable the L2 disk cache; off if omitted (`'none'` accepted as a no-op) |
+| `l1_max_rows` | No | off | Enables the L1 memory cache; max rows (default 10000 when set) |
+| `l1_max_bytes` | No | off | Enables the L1 memory cache; max bytes (default 64 MiB when set) |
 | `pool_max_open` | No | `32` | Maximum simultaneously open database connections |
 | `l2_refresh_sec` | No | `300` | L2 shadow table refresh interval in seconds |
 | `schema` | No | — | Manual column definition (e.g., `'id INTEGER, name TEXT'`), bypasses auto-discovery |
