@@ -25,14 +25,12 @@ The schema is discovered at `CREATE VIRTUAL TABLE` time by opening the first act
 
 ### cache_db (optional)
 
-Path to a database file used for L2 shadow table caching. **L2 is enabled by default** — if omitted, a cache database is auto-generated at `/tmp/clearprism_cache_{vtab}_{table}.db` (e.g., `/tmp/clearprism_cache_all_users_users.db`).
-
-Set `cache_db='none'` to explicitly disable L2 and use only L1 in-memory caching.
+Path to a database file used for L2 shadow table caching. **L2 is off by default** — set `cache_db='<path>'` to enable it. When omitted, no shadow copy is made and no background refresh thread is started.
 
 | | |
 |---|---|
-| **Default** | `/tmp/clearprism_cache_{vtab}_{table}.db` |
-| **Type** | String (path, or `'none'` to disable) |
+| **Default** | off (no L2 cache) |
+| **Type** | String (path to enable; `'none'` accepted as a no-op) |
 
 ```sql
 -- Custom L2 path
@@ -188,7 +186,7 @@ CREATE VIRTUAL TABLE all_users USING clearprism(
 );
 ```
 
-This uses all defaults: 10K row L1 cache, 64 MiB memory limit, 32 max connections, auto-generated L2 disk cache at `/tmp/clearprism_cache_all_users_users.db`, 5-minute L2 refresh, 60-second registry auto-reload interval.
+This uses all defaults: no caching (neither L1 nor L2), 32 max connections, 60-second registry auto-reload interval. Caching is opt-in — add `l1_max_rows`/`l1_max_bytes` for the L1 memory cache or `cache_db='<path>'` for the L2 disk cache.
 
 ## Tuning Guidelines
 

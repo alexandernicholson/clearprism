@@ -485,7 +485,7 @@ static void test_admin_cache_hit_miss(void)
 
     char *sql = sqlite3_mprintf(
         "CREATE VIRTUAL TABLE test_items USING clearprism("
-        "  registry_db='%s', table='items')", ADMIN_REG_PATH);
+        "  registry_db='%s', table='items', l1_max_rows='10000')", ADMIN_REG_PATH);
     sqlite3_exec(db, sql, NULL, NULL, NULL);
     sqlite3_free(sql);
 
@@ -520,9 +520,9 @@ static void test_admin_cache_hit_miss(void)
     admin_cleanup();
 }
 
-/* ========== L2 auto-enable tests ========== */
+/* ========== L1 cache default tests ========== */
 
-static void test_admin_l2_auto_enable(void)
+static void test_admin_l1_default_off(void)
 {
     admin_setup();
 
@@ -530,32 +530,97 @@ static void test_admin_l2_auto_enable(void)
     sqlite3_open(":memory:", &db);
     clearprism_init(db);
 
-    /* Create vtab WITHOUT cache_db — L2 should auto-enable */
+    /* No l1_max_rows/l1_max_bytes — no cache by default, L1 stays off */
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE test_items USING clearprism("
+        "  registry_db='%s', table='items')", ADMIN_REG_PATH);
+    int rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+    test_report("l1_default_off: vtab created", rc == SQLITE_OK);
+
+    if (rc == SQLITE_OK) {
+        /* Two identical queries — with no L1 there is nothing to cache */
+        for (int i = 0; i < 2; i++) {
+            sqlite3_stmt *q = NULL;
+            sqlite3_prepare_v2(db, "SELECT * FROM test_items WHERE name = 'Widget'",
+                               -1, &q, NULL);
+            while (sqlite3_step(q) == SQLITE_ROW) {}
+            sqlite3_finalize(q);
+        }
+        sqlite3_stmt *stmt = NULL;
+        sqlite3_prepare_v2(db, "SELECT clearprism_status('items')", -1, &stmt, NULL);
+        sqlite3_step(stmt);
+        const char *json = (const char *)sqlite3_column_text(stmt, 0);
+        test_report("l1_default_off: l1 max_rows is 0",
+                    json && strstr(json, "\"max_rows\":0") != NULL);
+        sqlite3_finalize(stmt);
+        sqlite3_exec(db, "DROP TABLE test_items", NULL, NULL, NULL);
+    }
+
+    sqlite3_close(db);
+    admin_cleanup();
+}
+
+static void test_admin_l1_opt_in(void)
+{
+    admin_setup();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    char *sql = sqlite3_mprintf(
+        "CREATE VIRTUAL TABLE test_items USING clearprism("
+        "  registry_db='%s', table='items', l1_max_rows='5000')", ADMIN_REG_PATH);
+    int rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+    test_report("l1_opt_in: vtab created", rc == SQLITE_OK);
+
+    if (rc == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        sqlite3_prepare_v2(db, "SELECT clearprism_status('items')", -1, &stmt, NULL);
+        sqlite3_step(stmt);
+        const char *json = (const char *)sqlite3_column_text(stmt, 0);
+        test_report("l1_opt_in: l1 max_rows reflects config",
+                    json && strstr(json, "\"max_rows\":5000") != NULL);
+        sqlite3_finalize(stmt);
+        sqlite3_exec(db, "DROP TABLE test_items", NULL, NULL, NULL);
+    }
+
+    sqlite3_close(db);
+    admin_cleanup();
+}
+
+/* ========== L2 cache default tests ========== */
+
+static void test_admin_l2_default_off(void)
+{
+    admin_setup();
+
+    sqlite3 *db = NULL;
+    sqlite3_open(":memory:", &db);
+    clearprism_init(db);
+
+    /* Create vtab WITHOUT cache_db — no cache by default, L2 stays off */
     char *sql = sqlite3_mprintf(
         "CREATE VIRTUAL TABLE test_items USING clearprism("
         "  registry_db='%s', table='items')", ADMIN_REG_PATH);
     char *err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
     sqlite3_free(sql);
-    test_report("l2_auto: vtab created", rc == SQLITE_OK);
+    test_report("l2_default_off: vtab created", rc == SQLITE_OK);
     if (err) { printf("    error: %s\n", err); sqlite3_free(err); err = NULL; }
 
-    /* Status should show l2_active:1 */
     if (rc == SQLITE_OK) {
         sqlite3_stmt *stmt = NULL;
         sqlite3_prepare_v2(db, "SELECT clearprism_status('items')", -1, &stmt, NULL);
         sqlite3_step(stmt);
         const char *json = (const char *)sqlite3_column_text(stmt, 0);
-        test_report("l2_auto: l2_active is 1", json && strstr(json, "\"l2_active\":1") != NULL);
+        test_report("l2_default_off: l2_active is 0", json && strstr(json, "\"l2_active\":0") != NULL);
         sqlite3_finalize(stmt);
 
         sqlite3_exec(db, "DROP TABLE test_items", NULL, NULL, NULL);
     }
-
-    /* Clean up auto-generated cache file */
-    unlink("/tmp/clearprism_cache_test_items_items.db");
-    unlink("/tmp/clearprism_cache_test_items_items.db-wal");
-    unlink("/tmp/clearprism_cache_test_items_items.db-shm");
 
     sqlite3_close(db);
     admin_cleanup();
@@ -694,7 +759,9 @@ int test_admin_run(void)
     test_admin_source_errors_column();
     test_admin_schema_override();
     test_admin_cache_hit_miss();
-    test_admin_l2_auto_enable();
+    test_admin_l1_default_off();
+    test_admin_l1_opt_in();
+    test_admin_l2_default_off();
     test_admin_l2_disable();
     test_admin_l2_incremental_refresh();
     return 0;
